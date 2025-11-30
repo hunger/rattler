@@ -19,6 +19,49 @@ use thiserror::Error;
 
 use crate::activation::PathModificationBehavior;
 
+/// Set the PATH variable to the given paths.
+fn set_unix_path(
+    shell: &(impl Shell + ?Sized),
+    f: &mut impl Write,
+    paths: &[PathBuf],
+    modification_behavior: PathModificationBehavior,
+    platform: &Platform,
+) -> ShellResult {
+    // Put paths in a vector of the correct format.
+    let paths_vec = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect_vec();
+
+    // Create the shell specific list of paths.
+    let paths_string = if cfg!(windows) {
+        // Use cygpath to convert the paths joined with the Windows ";" separator.
+        match native_path_to_unix(&paths_vec.join(";")) {
+            Ok(path) => path,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // When cygpath isn't found, join the paths with the posix separator.
+                paths_vec.join(":")
+            }
+            Err(e) => panic!("{e}"),
+        }
+    } else {
+        paths_vec.join(":")
+    };
+    // Replace, Append, or Prepend the path variable to the paths.
+    let path_var = shell.path_var(platform);
+    let paths_string: String = match modification_behavior {
+        PathModificationBehavior::Replace => paths_string,
+        PathModificationBehavior::Prepend => {
+            format!("{paths_string}:{}", &shell.format_env_var(path_var))
+        }
+        PathModificationBehavior::Append => {
+            format!("{}:{paths_string}", shell.format_env_var(path_var))
+        }
+    };
+
+    shell.set_env_var(f, path_var, paths_string.as_str())
+}
+
 /// A trait for generating shell scripts.
 /// The trait is implemented for each shell individually.
 ///
@@ -306,43 +349,7 @@ impl Shell for Bash {
         modification_behavior: PathModificationBehavior,
         platform: &Platform,
     ) -> ShellResult {
-        // Put paths in a vector of the correct format.
-        let paths_vec = paths
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect_vec();
-
-        // Create the shell specific list of paths.
-        let paths_string = if cfg!(windows) {
-            // Use cygpath to convert the paths joined with the Windows ";" separator.
-            match native_path_to_unix(&paths_vec.join(";")) {
-                Ok(path) => path,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // When cygpath isn't found, join the paths with the posix separator.
-                    paths_vec.join(":")
-                }
-                Err(e) => panic!("{e}"),
-            }
-        } else {
-            paths_vec.join(":")
-        };
-        // Replace, Append, or Prepend the path variable to the paths.
-        let path_var = self.path_var(platform);
-        let combined_paths_string: String = match modification_behavior {
-            PathModificationBehavior::Replace => paths_string,
-            PathModificationBehavior::Prepend => {
-                format!("{paths_string}:{}", &self.format_env_var(path_var))
-            }
-            PathModificationBehavior::Append => {
-                format!("{}:{paths_string}", self.format_env_var(path_var))
-            }
-        };
-        // Use double quotes "" so that ${PATH} is substituted. Calling set_env_var
-        // would correctly escape ${PATH} so that it literally is in the result.
-        Ok(writeln!(
-            f,
-            "export {path_var}=\"{combined_paths_string}\""
-        )?)
+        set_unix_path(self, f, paths, modification_behavior, platform)
     }
 
     /// For Bash, the path variable is always all capital PATH, even on Windows.
@@ -426,6 +433,16 @@ impl Shell for Zsh {
     fn unset_env_var(&self, f: &mut impl Write, env_var: &str) -> ShellResult {
         validate_env_var_name(env_var)?;
         Ok(writeln!(f, "unset {env_var}")?)
+    }
+
+    fn set_path(
+        &self,
+        f: &mut impl Write,
+        paths: &[PathBuf],
+        modification_behavior: PathModificationBehavior,
+        platform: &Platform,
+    ) -> ShellResult {
+        set_unix_path(self, f, paths, modification_behavior, platform)
     }
 
     fn run_script(&self, f: &mut impl Write, path: &Path) -> ShellResult {
@@ -722,7 +739,7 @@ impl Shell for Fish {
     }
 
     fn format_env_var(&self, var_name: &str) -> String {
-        // Fish doesnt want the extra brackets '{}'
+        // Fish doesn't want the extra brackets '{}'
         format!("${var_name}")
     }
 
@@ -733,6 +750,16 @@ impl Shell for Fish {
 
     fn run_script(&self, f: &mut impl Write, path: &Path) -> ShellResult {
         Ok(writeln!(f, "source \"{}\"", path.to_string_lossy())?)
+    }
+
+    fn set_path(
+        &self,
+        f: &mut impl Write,
+        paths: &[PathBuf],
+        modification_behavior: PathModificationBehavior,
+        platform: &Platform,
+    ) -> ShellResult {
+        set_unix_path(self, f, paths, modification_behavior, platform)
     }
 
     fn extension(&self) -> &str {
@@ -1161,6 +1188,11 @@ mod tests {
         let mut script = ShellScript::new(Bash, Platform::Linux64);
 
         let paths = vec![PathBuf::from("bar"), PathBuf::from("a/b")];
+        let paths_with_space = vec![
+            PathBuf::from("ba r"),
+            PathBuf::from("a/b c"),
+            PathBuf::from("/My stuff/foo"),
+        ];
 
         script
             .set_env_var("FOO", "bar")
@@ -1178,6 +1210,12 @@ mod tests {
             .set_path(&paths, PathModificationBehavior::Prepend)
             .unwrap()
             .set_path(&paths, PathModificationBehavior::Replace)
+            .unwrap()
+            .set_path(&paths_with_space, PathModificationBehavior::Append)
+            .unwrap()
+            .set_path(&paths_with_space, PathModificationBehavior::Prepend)
+            .unwrap()
+            .set_path(&paths_with_space, PathModificationBehavior::Replace)
             .unwrap()
             .run_script(&PathBuf::from_str("foo.sh").unwrap())
             .unwrap()

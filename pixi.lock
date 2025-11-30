@@ -3,6 +3,8 @@ environments:
   default:
     channels:
     - url: https://prefix.dev/conda-forge/
+    options:
+      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://prefix.dev/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
@@ -14,6 +16,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/c-ares-1.34.5-hb9d3cd8_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/c-compiler-1.11.0-h4d9bdce_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/linux-64/cargo-insta-1.46.0-hb17b654_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/cargo-nextest-0.9.106-hb17b654_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/clang-18-18.1.8-default_h99862b1_15.conda
       - conda: https://prefix.dev/conda-forge/linux-64/clang-18.1.8-default_h36abe19_15.conda
@@ -84,6 +87,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/osx-64/c-ares-1.34.5-hf13058a_0.conda
       - conda: https://prefix.dev/conda-forge/osx-64/c-compiler-1.11.0-h7a00415_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/osx-64/cargo-insta-1.46.0-ha9c3995_0.conda
       - conda: https://prefix.dev/conda-forge/osx-64/cargo-nextest-0.9.106-h3c2ae71_0.conda
       - conda: https://prefix.dev/conda-forge/osx-64/cctools-1024.3-h67a6458_9.conda
       - conda: https://prefix.dev/conda-forge/osx-64/cctools_osx-64-1024.3-llvm19_1_h3b512aa_9.conda
@@ -142,6 +146,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/osx-arm64/c-ares-1.34.5-h5505292_0.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/c-compiler-1.11.0-h61f9b84_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/osx-arm64/cargo-insta-1.46.0-h6fdd925_0.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/cargo-nextest-0.9.106-h8d80559_0.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/cctools-1024.3-hd01ab73_9.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/cctools_osx-arm64-1024.3-llvm19_1_h8c76c84_9.conda
@@ -203,6 +208,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/win-64/_openmp_mutex-4.5-2_gnu.conda
       - conda: https://prefix.dev/conda-forge/win-64/bzip2-1.0.8-h0ad9c76_8.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-h4c7d964_0.conda
+      - conda: https://prefix.dev/conda-forge/win-64/cargo-insta-1.46.0-h18a1a76_0.conda
       - conda: https://prefix.dev/conda-forge/win-64/cargo-nextest-0.9.106-h18a1a76_0.conda
       - conda: https://prefix.dev/conda-forge/win-64/cmake-3.26.4-h1537add_0.conda
       - conda: https://prefix.dev/conda-forge/win-64/cxx-compiler-1.11.0-h1c1089f_0.conda
@@ -231,6 +237,8 @@ environments:
   lint:
     channels:
     - url: https://prefix.dev/conda-forge/
+    options:
+      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://prefix.dev/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
@@ -243,6 +251,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/linux-64/c-ares-1.34.5-hb9d3cd8_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/c-compiler-1.11.0-h4d9bdce_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/linux-64/cargo-insta-1.46.0-hb17b654_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/cargo-nextest-0.9.106-hb17b654_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/clang-18-18.1.8-default_h99862b1_15.conda
       - conda: https://prefix.dev/conda-forge/linux-64/clang-18.1.8-default_h36abe19_15.conda
@@ -328,6 +337,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/osx-64/c-ares-1.34.5-hf13058a_0.conda
       - conda: https://prefix.dev/conda-forge/osx-64/c-compiler-1.11.0-h7a00415_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/osx-64/cargo-insta-1.46.0-ha9c3995_0.conda
       - conda: https://prefix.dev/conda-forge/osx-64/cargo-nextest-0.9.106-h3c2ae71_0.conda
       - conda: https://prefix.dev/conda-forge/osx-64/cctools-1024.3-h67a6458_9.conda
       - conda: https://prefix.dev/conda-forge/osx-64/cctools_osx-64-1024.3-llvm19_1_h3b512aa_9.conda
@@ -401,6 +411,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/osx-arm64/c-ares-1.34.5-h5505292_0.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/c-compiler-1.11.0-h61f9b84_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-hbd8a1cb_0.conda
+      - conda: https://prefix.dev/conda-forge/osx-arm64/cargo-insta-1.46.0-h6fdd925_0.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/cargo-nextest-0.9.106-h8d80559_0.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/cctools-1024.3-hd01ab73_9.conda
       - conda: https://prefix.dev/conda-forge/osx-arm64/cctools_osx-arm64-1024.3-llvm19_1_h8c76c84_9.conda
@@ -477,6 +488,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/win-64/actionlint-1.7.8-he477eed_0.conda
       - conda: https://prefix.dev/conda-forge/win-64/bzip2-1.0.8-h0ad9c76_8.conda
       - conda: https://prefix.dev/conda-forge/noarch/ca-certificates-2025.10.5-h4c7d964_0.conda
+      - conda: https://prefix.dev/conda-forge/win-64/cargo-insta-1.46.0-h18a1a76_0.conda
       - conda: https://prefix.dev/conda-forge/win-64/cargo-nextest-0.9.106-h18a1a76_0.conda
       - conda: https://prefix.dev/conda-forge/win-64/cmake-3.26.4-h1537add_0.conda
       - conda: https://prefix.dev/conda-forge/win-64/cxx-compiler-1.11.0-h1c1089f_0.conda
@@ -519,6 +531,8 @@ environments:
   minio:
     channels:
     - url: https://prefix.dev/conda-forge/
+    options:
+      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://prefix.dev/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
@@ -578,6 +592,8 @@ environments:
   s3:
     channels:
     - url: https://prefix.dev/conda-forge/
+    options:
+      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://prefix.dev/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
@@ -1798,6 +1814,51 @@ packages:
   license: ISC
   size: 155907
   timestamp: 1759649036195
+- conda: https://prefix.dev/conda-forge/linux-64/cargo-insta-1.46.0-hb17b654_0.conda
+  sha256: 2268608cf948e0c3b5252e32896902cbb37610d73b33410f4ad0864b7f061432
+  md5: 63570d225ebed6800e9bb6acf5a9b3c5
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - libgcc >=14
+  constrains:
+  - __glibc >=2.17
+  license: Apache-2.0
+  license_family: APACHE
+  size: 1754923
+  timestamp: 1767497130492
+- conda: https://prefix.dev/conda-forge/osx-64/cargo-insta-1.46.0-ha9c3995_0.conda
+  sha256: c820983b9ff4ff6ab5965c17b78c291d7e5b9f53fa16b5733e63791ad63a91ee
+  md5: 66a37c06032da97f0d1b5e77d1ab7f9f
+  depends:
+  - __osx >=10.13
+  constrains:
+  - __osx >=10.13
+  license: Apache-2.0
+  license_family: APACHE
+  size: 1728653
+  timestamp: 1767497127197
+- conda: https://prefix.dev/conda-forge/osx-arm64/cargo-insta-1.46.0-h6fdd925_0.conda
+  sha256: 5903fecb88551629ba449b2a09f4c457c1d6026c2104bdd04567186dca12e03a
+  md5: 3652ee990bcc7ed5bca21249b0f636b5
+  depends:
+  - __osx >=11.0
+  constrains:
+  - __osx >=11.0
+  license: Apache-2.0
+  license_family: APACHE
+  size: 1601362
+  timestamp: 1767497158249
+- conda: https://prefix.dev/conda-forge/win-64/cargo-insta-1.46.0-h18a1a76_0.conda
+  sha256: 7e9f4c7fdaf3510ea3c552658e73441028665387171683eb40ff8d11f71190eb
+  md5: 0eb5512b449d5ad7523a8f25dccc4684
+  depends:
+  - vc >=14.3,<15
+  - vc14_runtime >=14.44.35208
+  - ucrt >=10.0.20348.0
+  license: Apache-2.0
+  license_family: APACHE
+  size: 1887234
+  timestamp: 1767497155829
 - conda: https://prefix.dev/conda-forge/linux-64/cargo-nextest-0.9.106-hb17b654_0.conda
   sha256: ef50413b3b4724af0e6b56649ae0ec6bcca826c38df7427a8bfd4df013f19d74
   md5: 35fa917b13cd976bfa315f7cc9a4fcc2
@@ -4381,24 +4442,12 @@ packages:
   constrains:
   - __osx >=11.0
   license: BSD-3-Clause
-  input:
-    hash: d20f174d88e2fee5e8df0975d2231d2748e5caeb3170ba3d1b0a9f0fe1557c35
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: crates/rattler-bin
   name: rattler
   version: 0.1.0
   build: h6eef762_0
   subdir: win-64
   license: BSD-3-Clause
-  input:
-    hash: d20f174d88e2fee5e8df0975d2231d2748e5caeb3170ba3d1b0a9f0fe1557c35
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: crates/rattler-bin
   name: rattler
   version: 0.1.0
@@ -4407,12 +4456,6 @@ packages:
   constrains:
   - __osx >=10.13
   license: BSD-3-Clause
-  input:
-    hash: d20f174d88e2fee5e8df0975d2231d2748e5caeb3170ba3d1b0a9f0fe1557c35
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: crates/rattler-bin
   name: rattler
   version: 0.1.0
@@ -4421,12 +4464,6 @@ packages:
   constrains:
   - __glibc >=2.17
   license: BSD-3-Clause
-  input:
-    hash: d20f174d88e2fee5e8df0975d2231d2748e5caeb3170ba3d1b0a9f0fe1557c35
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: crates/rattler_index
   name: rattler_index
   version: 0.27.6
@@ -4435,24 +4472,12 @@ packages:
   constrains:
   - __osx >=11.0
   license: BSD-3-Clause
-  input:
-    hash: 6d317b0d51f65bf163e7684c671acccdd6b16ae868adb13aae7766ff864e57c8
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: crates/rattler_index
   name: rattler_index
   version: 0.27.6
   build: h6eef762_0
   subdir: win-64
   license: BSD-3-Clause
-  input:
-    hash: 6d317b0d51f65bf163e7684c671acccdd6b16ae868adb13aae7766ff864e57c8
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: crates/rattler_index
   name: rattler_index
   version: 0.27.6
@@ -4461,12 +4486,6 @@ packages:
   constrains:
   - __osx >=10.13
   license: BSD-3-Clause
-  input:
-    hash: 6d317b0d51f65bf163e7684c671acccdd6b16ae868adb13aae7766ff864e57c8
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: crates/rattler_index
   name: rattler_index
   version: 0.27.6
@@ -4475,12 +4494,6 @@ packages:
   constrains:
   - __glibc >=2.17
   license: BSD-3-Clause
-  input:
-    hash: 6d317b0d51f65bf163e7684c671acccdd6b16ae868adb13aae7766ff864e57c8
-    globs:
-    - ../../Cargo.toml
-    - ../Cargo.toml
-    - Cargo.toml
 - conda: https://prefix.dev/conda-forge/linux-64/readline-8.2-h8c095d6_2.conda
   sha256: 2d6d0c026902561ed77cd646b5021aef2d4db22e57a5b0178dfc669231e06d2c
   md5: 283b96675859b20a825f8fa30f311446
