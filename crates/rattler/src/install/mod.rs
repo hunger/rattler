@@ -125,6 +125,14 @@ pub enum InstallError {
     /// Post-processing involves removing clobbered paths.
     #[error("failed to post process the environment (unclobbering)")]
     PostProcessFailed(#[source] std::io::Error),
+
+    /// A package-supplied relative path's *parent directory*
+    /// would escape the prefix after lexical normalisation. The
+    /// directory-creation pass refuses to `create_dir` outside
+    /// the target prefix so a malicious channel can't drive an
+    /// `fs::create_dir` against e.g. `<prefix>/../../etc/cron.d`.
+    #[error("directory path escapes the prefix: {0}")]
+    DirectoryPathEscapesPrefix(PathBuf),
 }
 
 impl From<Cancelled> for InstallError {
@@ -780,6 +788,15 @@ pub fn link_package_sync(
         .into_iter()
         .sorted_by(|a, b| a.components().count().cmp(&b.components().count()))
     {
+        // Refuse a directory whose lexical resolution escapes the
+        // target prefix. The per-entry validation in `link_file`
+        // runs later; this pre-creation pass would otherwise be
+        // happy to `fs::create_dir(<prefix>/../../etc/cron.d)`
+        // because the malicious component just happens to live
+        // inside `entry.computed_path.parent()`.
+        if rattler_fs_safety::validate_relative_inside(target_dir.path(), &directory).is_err() {
+            return Err(InstallError::DirectoryPathEscapesPrefix(directory));
+        }
         let full_path = target_dir.path().join(&directory);
 
         // if we already (recursively) created the parent directory we can skip this
@@ -790,8 +807,12 @@ pub fn link_package_sync(
             continue;
         }
 
-        // can we lock this directory?
-        if full_path.exists() {
+        // Use `symlink_metadata` rather than `exists`: `exists`
+        // follows symlinks, so a co-tenant who plants a symlink
+        // at `full_path` would steer this branch into the
+        // "already there" skip even when the symlink target is
+        // outside the prefix.
+        if full_path.symlink_metadata().is_ok() {
             continue;
         }
 
