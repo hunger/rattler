@@ -401,15 +401,26 @@ impl MacOSMenu {
 
         for (src, dest) in link_in_bundle {
             let src = src.resolve(&self.placeholders);
-            let dest = dest.resolve(&self.placeholders);
-            let dest = self.directories.location.join(&dest);
-            if !dest.starts_with(&self.directories.location) {
-                return Err(MenuInstError::InstallError(format!(
-                    "'link_in_bundle' destinations MUST be created inside the .app bundle ({}), but it points to '{}'.",
+            let dest_relative = PathBuf::from(dest.resolve(&self.placeholders));
+            // Lexically refuse manifest dest paths that resolve
+            // outside the bundle. The previous `Path::starts_with`
+            // check was a *component-prefix* test, not a
+            // normalisation: `Contents/../../../tmp/x` joined to
+            // `<bundle>` and then `starts_with(<bundle>)` returns
+            // true component-wise even though the kernel resolves
+            // the joined path to `/tmp/x`. `validate_relative_inside`
+            // collapses `..` lexically before checking.
+            let dest = rattler_fs_safety::validate_relative_inside(
+                &self.directories.location,
+                &dest_relative,
+            )
+            .map_err(|_| {
+                MenuInstError::InstallError(format!(
+                    "'link_in_bundle' destinations MUST resolve inside the .app bundle ({}); '{}' escapes it.",
                     self.directories.location.display(),
-                    dest.display()
-                )));
-            }
+                    dest_relative.display()
+                ))
+            })?;
 
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;

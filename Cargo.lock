@@ -5540,6 +5540,7 @@ dependencies = [
  "plist",
  "quick-xml 0.37.5",
  "rattler_conda_types",
+ "rattler_fs_safety",
  "rattler_shell",
  "regex",
  "serde",
