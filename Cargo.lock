@@ -5632,8 +5632,10 @@ version = "0.1.1"
 dependencies = [
  "fs-err",
  "libc",
+ "rattler_fs_safety",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "windows-sys 0.61.2",
 ]
