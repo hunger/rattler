@@ -131,6 +131,15 @@ pub enum PackageCacheLayerError {
 
     #[error("package cache layer error: {0}")]
     OtherError(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// The cache-key's path representation contains path
+    /// separators or `..` components and would land outside the
+    /// layer's root directory. Refused before any filesystem
+    /// operation; a channel-supplied record with a malicious
+    /// `name` / `version` / `build_string` / `origin_hash`
+    /// triggers this.
+    #[error("cache-key path escapes the cache root: {0}")]
+    UnsafeCacheKeyPath(String),
 }
 
 impl From<Cancelled> for PackageCacheError {
@@ -153,10 +162,17 @@ impl From<PackageCacheLayerError> for PackageCacheError {
 }
 
 impl PackageCacheLayer {
-    /// Determine if the layer is read-only in the filesystem
+    /// Determine if the layer is read-only in the filesystem.
+    ///
+    /// Uses `symlink_metadata` rather than `metadata`: if a user
+    /// has pointed the layer root at a symlink, the
+    /// follow-symlink `metadata` would read the *target's* mode,
+    /// not the symlink's. That lets an attacker who controls the
+    /// symlink target steer which layer gets written to, and is
+    /// the cap-std-style of caveat the file-safety audit flagged.
     pub fn is_readonly(&self) -> bool {
         self.path
-            .metadata()
+            .symlink_metadata()
             .is_ok_and(|m| m.permissions().readonly())
     }
 
@@ -171,7 +187,7 @@ impl PackageCacheLayer {
             .ok_or(PackageCacheLayerError::PackageNotFound)?
             .clone();
         let mut cache_entry = cache_entry.lock().await;
-        let cache_path = self.path.join(cache_key.to_string());
+        let cache_path = safe_cache_path(&self.path, cache_key)?;
 
         match validate_package_common::<
             fn(PathBuf) -> _,
@@ -215,7 +231,7 @@ impl PackageCacheLayer {
             .clone();
 
         let mut cache_entry = entry.lock().await;
-        let cache_path = self.path.join(cache_key.to_string());
+        let cache_path = safe_cache_path(&self.path, cache_key)?;
 
         match validate_package_common(
             cache_path,
@@ -256,14 +272,16 @@ impl PackageCache {
         }
     }
 
-    /// Acquires a global lock on the package cache.
+    /// Acquires a coarse advisory lock covering the entire package cache.
     ///
-    /// This lock can be used to coordinate multiple package operations,
-    /// reducing the overhead of acquiring individual locks for each package.
-    /// The lock is held until the returned `CacheGlobalLock` is dropped.
+    /// Per-entry locking is handled unconditionally by
+    /// [`CacheMetadataFile`], so this lock is **not** required for
+    /// correctness against concurrent writers. It is intended for
+    /// cache-wide maintenance flows (eviction, audit) that want a
+    /// single point of mutual exclusion across many entries.
     ///
-    /// This is particularly useful when installing many packages at once,
-    /// as it significantly reduces the number of file locking syscalls.
+    /// The lock is held until the returned [`CacheGlobalLock`] is
+    /// dropped.
     pub async fn acquire_global_lock(&self) -> Result<CacheGlobalLock, PackageCacheError> {
         // Use the first writable layer's path for the global cache lock
         let (_, writable_layers) = self.split_layers();
@@ -358,9 +376,24 @@ impl PackageCache {
         let (_, writable_layers) = self.split_layers();
 
         for layer in self.inner.layers.iter() {
-            let cache_path = layer.path.join(cache_key.to_string());
+            // If the cache-key string would escape this layer's
+            // root, skip the layer entirely -- neither read nor
+            // write should reach a path the kernel resolves
+            // outside our control.
+            let Ok(cache_path) = safe_cache_path(&layer.path, &cache_key) else {
+                continue;
+            };
 
-            if cache_path.exists() {
+            // `Path::exists` follows symlinks, so an attacker
+            // who plants `<root>/<hex>` as a symlink to e.g.
+            // `/etc` would have us pass through to `try_validate`
+            // and then run package validation against the
+            // attacker's target. `symlink_metadata().is_dir()`
+            // requires the entry itself to be a real directory.
+            let cache_path_is_dir = cache_path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_dir());
+            if cache_path_is_dir {
                 match layer.try_validate(&cache_key).await {
                     Ok(lock) => {
                         return Ok(lock);
@@ -589,6 +622,50 @@ impl PackageCache {
 }
 
 /// Shared logic for validating a package.
+/// Validate that `cache_key.to_string()` (the directory name a
+/// new cache entry would land at) resolves inside `layer_path`.
+/// `CacheKey`'s `Display` interpolates the channel-supplied
+/// `name` / `version` / `build_string` / `origin_hash` fields,
+/// none of which are sanitized for path separators or `..`
+/// components, so an untrusted channel could otherwise steer a
+/// cache write outside the layer root.
+/// RAII cleanup for the random-named temp directory used during
+/// fetch. Drops fire `remove_dir_all` through the parent dir's
+/// fd so a half-fetched directory doesn't linger on failure. On
+/// the success path the temp dir is renamed out from under the
+/// guard before drop fires, so the cleanup becomes a no-op
+/// (`NotFound`).
+struct TempDirGuard<'a> {
+    dir: &'a rattler_fs_safety::Dir,
+    name: &'a std::ffi::OsStr,
+}
+
+impl<'a> TempDirGuard<'a> {
+    fn new(dir: &'a rattler_fs_safety::Dir, name: &'a std::ffi::OsStr) -> Self {
+        Self { dir, name }
+    }
+}
+
+impl Drop for TempDirGuard<'_> {
+    fn drop(&mut self) {
+        // Best-effort: a leaked temp dir is annoying but doesn't
+        // affect correctness, and the cache root is per-user so
+        // `<tmp>-<uuid>` clutter is bounded.
+        let _ = self.dir.remove_dir_all(self.name);
+    }
+}
+
+fn safe_cache_path(
+    layer_path: &Path,
+    cache_key: &CacheKey,
+) -> Result<PathBuf, PackageCacheLayerError> {
+    let key_str = cache_key.to_string();
+    if rattler_fs_safety::validate_relative_inside(layer_path, Path::new(&key_str)).is_err() {
+        return Err(PackageCacheLayerError::UnsafeCacheKeyPath(key_str));
+    }
+    Ok(layer_path.join(&key_str))
+}
+
 async fn validate_package_common<F, Fut, E>(
     path: PathBuf,
     known_valid_revision: Option<u64>,
@@ -602,8 +679,11 @@ where
     Fut: Future<Output = Result<(), E>> + 'static,
     E: Error + Send + Sync + 'static,
 {
-    // Open the cache metadata file to read/write revision and hash information.
-    // Concurrent access is coordinated via the global cache lock.
+    // Open the cache metadata file to read/write revision and hash
+    // information. `CacheMetadataFile::acquire` takes an exclusive
+    // `flock` on the entry's lock file, so concurrent callers in
+    // the same or different processes serialise here on a
+    // per-entry basis without needing the optional global lock.
     let lock_file_path = {
         // Append the `.lock` extension to the cache path to create the lock file path.
         let mut path_str = path.as_os_str().to_owned();
@@ -632,7 +712,14 @@ where
         _ => false,
     };
 
-    let cache_dir_exists = path.is_dir();
+    // `Path::is_dir` follows symlinks; a planted symlink at
+    // `path` pointing at e.g. `/etc` would make this return
+    // `true` and route the rest of the function into validating
+    // the attacker's target directory. `symlink_metadata` checks
+    // the entry itself.
+    let cache_dir_exists = path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_dir());
     if cache_dir_exists && !hash_mismatch {
         let path_inner = path.clone();
 
@@ -720,11 +807,51 @@ where
         })?;
 
         let prefix = path.file_name().and_then(|n| n.to_str()).unwrap_or("pkg");
+        let entry_name = path
+            .file_name()
+            .map(std::ffi::OsString::from)
+            .ok_or_else(|| {
+                PackageCacheLayerError::OtherError(Box::new(std::io::Error::other(format!(
+                    "cache path '{}' has no final component",
+                    path.display()
+                ))))
+            })?;
 
-        // Use tempfile::Builder to create a temp directory with automatic cleanup on failure
-        let temp_dir = tempfile::Builder::new()
-            .prefix(&format!(".{prefix}"))
-            .tempdir_in(parent_dir)
+        // Open the parent directory as a cap-std capability *before*
+        // creating the temp directory, so every subsequent op against
+        // the temp slot (mkdir, fetch, optional cleanup, post-fetch
+        // rename) is anchored to the open fd rather than re-resolved
+        // by path on every step.
+        let parent_cap_dir = rattler_fs_safety::Dir::open_ambient_dir(
+            parent_dir,
+            rattler_fs_safety::ambient_authority(),
+        )
+        .map_err(|e| {
+            PackageCacheLayerError::OtherError(Box::new(std::io::Error::other(format!(
+                "failed to open parent dir '{}': {}",
+                parent_dir.display(),
+                e
+            ))))
+        })?;
+
+        // Random temp-dir name so a co-tenant can't predict the
+        // slot. cap-std's `create_dir_with` is `mkdirat(2)` on
+        // the parent fd; the create and any later reference to
+        // the same name resolve through the same dir-fd, so a
+        // path-component symlink swap on the parent directory
+        // can't redirect operations.
+        let temp_name =
+            std::ffi::OsString::from(format!(".{prefix}-{}", uuid::Uuid::new_v4().simple()));
+        // Mode-setting is Unix-only; `mut` is too on non-Unix.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut dir_builder = rattler_fs_safety::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use rattler_fs_safety::DirBuilderExt;
+            dir_builder.mode(0o700);
+        }
+        parent_cap_dir
+            .create_dir_with(&temp_name, &dir_builder)
             .map_err(|e| {
                 PackageCacheLayerError::OtherError(Box::new(std::io::Error::other(format!(
                     "failed to create temp directory in '{}': {}",
@@ -732,19 +859,41 @@ where
                     e
                 ))))
             })?;
+        // RAII guard: removes the temp dir on Drop. Fires on
+        // every error path between here and the rename below.
+        // Prefixed with `_` so the unused-binding lint stays
+        // quiet; the binding is live for the whole scope, which
+        // is what keeps the Drop scheduled for end-of-scope
+        // rather than firing immediately.
+        let _temp_guard = TempDirGuard::new(&parent_cap_dir, &temp_name);
+
+        // The fetch closure signature is `Fn(PathBuf) -> Fut`, so
+        // we hand it an absolute path. The directory at this path
+        // was just created via `parent_cap_dir`; an attacker who
+        // can race a symlink swap of `parent_dir` itself could
+        // still redirect the fetch, but the same threat would have
+        // already let them redirect `parent_cap_dir`'s open above.
+        let temp_path = parent_dir.join(&temp_name);
 
         // Fetch/extract the package to the temporary directory.
-        let fetch_result = fetch_fn(temp_dir.path().to_path_buf()).await;
+        let fetch_result = fetch_fn(temp_path.clone()).await;
 
         // Handle fetch result
         match fetch_result {
             Ok(()) => {
-                // Take ownership of the temp directory path so it won't be auto-deleted
-                let temp_path = temp_dir.keep();
-
-                // Remove any existing (potentially corrupted) directory at the final path
-                if path.is_dir() {
-                    tokio_fs::remove_dir_all(&path).await.map_err(|e| {
+                // Remove any existing (potentially corrupted)
+                // directory at the final path. Route the delete
+                // through the parent dir-fd so a planted symlink
+                // at `entry_name` can't redirect the delete onto
+                // an attacker-chosen target -- cap-std refuses to
+                // traverse a symlink at the final component for
+                // this op. `NotFound` is fine, `AlreadyExists`
+                // is impossible here.
+                let entry_is_dir = parent_cap_dir
+                    .symlink_metadata(&entry_name)
+                    .is_ok_and(|m| m.file_type().is_dir());
+                if entry_is_dir {
+                    parent_cap_dir.remove_dir_all(&entry_name).map_err(|e| {
                         PackageCacheLayerError::OtherError(Box::new(std::io::Error::other(
                             format!(
                                 "failed to remove existing cache directory '{}': {}",
@@ -755,15 +904,27 @@ where
                     })?;
                 }
 
-                // Atomically rename the temp directory to the final destination
-                tokio_fs::rename(&temp_path, &path).await.map_err(|e| {
-                    PackageCacheLayerError::OtherError(Box::new(std::io::Error::other(format!(
-                        "failed to rename temp directory '{}' to '{}': {}",
-                        temp_path.display(),
-                        path.display(),
-                        e
-                    ))))
-                })?;
+                // Atomically rename through the parent dir-fd
+                // (`renameat(2)` on Unix, `MoveFileEx` on
+                // Windows). The path-based `tokio_fs::rename` had
+                // a swap window between `keep()` returning the
+                // PathBuf and the rename actually firing -- an
+                // attacker could turn the source path into a
+                // symlink and steer the rename. With the parent
+                // fd held, both sides of the rename resolve
+                // through it and the swap window closes.
+                parent_cap_dir
+                    .rename(&temp_name, &parent_cap_dir, &entry_name)
+                    .map_err(|e| {
+                        PackageCacheLayerError::OtherError(Box::new(std::io::Error::other(
+                            format!(
+                                "failed to rename temp directory '{}' to '{}': {}",
+                                temp_path.display(),
+                                path.display(),
+                                e
+                            ),
+                        )))
+                    })?;
 
                 // After fetching, return the cache metadata with the new revision.
                 // We don't need to re-validate since we just fetched it.
@@ -1540,6 +1701,42 @@ mod test {
         assert!(
             should_run.load(Ordering::Relaxed),
             "fetch function should run again"
+        );
+    }
+
+    /// A `CacheKey` whose `Display` would resolve outside the layer
+    /// root must be rejected by `safe_cache_path` before any
+    /// filesystem operation. The fields are channel-supplied and
+    /// not sanitized for path separators.
+    #[test]
+    fn safe_cache_path_rejects_escaping_key() {
+        let layer_root = Path::new("/cache/pkgs");
+        let escaping_key = super::CacheKey {
+            name: "../etc".to_string(),
+            version: "1.0".to_string(),
+            build_string: "x".to_string(),
+            sha256: None,
+            md5: None,
+            origin_hash: None,
+        };
+
+        assert!(matches!(
+            super::safe_cache_path(layer_root, &escaping_key),
+            Err(super::PackageCacheLayerError::UnsafeCacheKeyPath(_))
+        ));
+
+        // Sanity: a benign key still resolves through the helper.
+        let benign_key = super::CacheKey {
+            name: "ok".to_string(),
+            version: "1.0".to_string(),
+            build_string: "x".to_string(),
+            sha256: None,
+            md5: None,
+            origin_hash: None,
+        };
+        assert_eq!(
+            super::safe_cache_path(layer_root, &benign_key).unwrap(),
+            layer_root.join("ok-1.0-x")
         );
     }
 }
