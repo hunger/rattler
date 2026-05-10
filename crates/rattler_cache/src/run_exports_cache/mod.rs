@@ -123,7 +123,18 @@ impl RunExportsCache {
         Fut: Future<Output = Result<Option<NamedTempFile>, E>> + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
-        let cache_path = self.inner.path.join(cache_key.to_string());
+        // `cache_key.to_string()` interpolates the channel-
+        // supplied `name`/`version`/`build_string` fields. None
+        // are sanitized for path separators, so a malicious
+        // record with `build_string = "../etc/cron.d/x"` could
+        // otherwise steer `persist` outside the cache root.
+        let cache_key_str = cache_key.to_string();
+        if rattler_fs_safety::validate_relative_inside(&self.inner.path, Path::new(&cache_key_str))
+            .is_err()
+        {
+            return Err(RunExportsCacheError::UnsafeCacheKeyPath(cache_key_str));
+        }
+        let cache_path = self.inner.path.join(&cache_key_str);
         let cache_entry = self
             .inner
             .run_exports
@@ -347,6 +358,14 @@ pub enum RunExportsCacheError {
     /// The operation was cancelled
     #[error("operation was cancelled")]
     Cancelled,
+
+    /// The cache-key's path representation (a concatenation of
+    /// channel-supplied `name`-`version`-`build_string` plus a
+    /// hash) contains path separators or `..` components and
+    /// would land outside the cache root. Refused before any
+    /// `persist` or `read_to_string` call.
+    #[error("cache-key path escapes the cache root: {0}")]
+    UnsafeCacheKeyPath(String),
 }
 
 struct PassthroughReporter {
@@ -726,5 +745,39 @@ mod test {
             .unwrap();
 
         assert!(cached_run_exports.run_exports.is_some());
+    }
+
+    /// A `CacheKey` whose `Display` contains `..` (because a channel-
+    /// supplied `build_string` was malicious) must be rejected before
+    /// any filesystem operation that would land outside the cache root.
+    #[tokio::test]
+    async fn test_get_or_fetch_rejects_escaping_cache_key() {
+        let cache_dir = tempdir().unwrap();
+        let cache = RunExportsCache::new(cache_dir.path());
+
+        // Display assembles `name-version-build…ext`; a name with
+        // `../` introduces a `ParentDir` component that
+        // `validate_relative_inside` refuses.
+        let escaping_key = CacheKey {
+            name: "../etc".to_string(),
+            version: "1.0".to_string(),
+            build_string: "x".to_string(),
+            sha256: None,
+            md5: None,
+            extension: ".tar.bz2".to_string(),
+        };
+
+        let result = cache
+            .get_or_fetch(&escaping_key, || async {
+                panic!("fetch must not run when key is rejected");
+                #[allow(unreachable_code)]
+                Ok::<_, std::io::Error>(None)
+            })
+            .await;
+
+        assert_matches!(
+            result,
+            Err(super::RunExportsCacheError::UnsafeCacheKeyPath(_))
+        );
     }
 }
