@@ -37,6 +37,14 @@ pub enum UnlinkError {
     /// Failed to move a file to the trash
     #[error("failed to move file: {0} to {1}")]
     FailedToMoveFile(String, String, std::io::Error),
+
+    /// A package-supplied relative path (the prefix-record's
+    /// `paths.json::relative_path` or the conda-meta filename)
+    /// would escape the prefix directory. Refused before any
+    /// `remove_file` call so a malicious package can't drive
+    /// uninstall into deleting files outside the prefix.
+    #[error("relative path escapes the prefix: {0}")]
+    RelativePathEscapesPrefix(PathBuf),
 }
 
 pub(crate) fn recursively_remove_empty_directories(
@@ -45,10 +53,16 @@ pub(crate) fn recursively_remove_empty_directories(
     is_python_noarch: bool,
     keep_directories: &HashSet<PathBuf>,
 ) -> Result<PathBuf, UnlinkError> {
-    // Never delete the target prefix
-    if directory_path == target_prefix
-        || keep_directories.contains(directory_path)
-        || !directory_path.exists()
+    // Never delete the target prefix, or skip if this path
+    // doesn't exist as a real directory. `symlink_metadata`
+    // (not `exists`) so a co-tenant who plants a symlink at a
+    // no-longer-needed prefix subdir doesn't get us to traverse
+    // -- and accidentally delete entries from -- their target.
+    let symlink_meta = directory_path.symlink_metadata().ok();
+    let is_real_dir = symlink_meta
+        .as_ref()
+        .is_some_and(|m| m.file_type().is_dir());
+    if directory_path == target_prefix || keep_directories.contains(directory_path) || !is_real_dir
     {
         return Ok(directory_path.to_path_buf());
     }
@@ -184,6 +198,18 @@ pub async fn unlink_package(
 ) -> Result<(), UnlinkError> {
     // Remove all entries
     for paths in prefix_record.paths_data.paths.iter() {
+        // Refuse a `relative_path` that resolves outside the
+        // prefix. Without this check, a malicious package whose
+        // `paths.json` declared `../../etc/cron.d/x` would have
+        // `unlink_package` delete the user's `cron.d` file at
+        // uninstall time.
+        if rattler_fs_safety::validate_relative_inside(target_prefix.path(), &paths.relative_path)
+            .is_err()
+        {
+            return Err(UnlinkError::RelativePathEscapesPrefix(
+                paths.relative_path.clone(),
+            ));
+        }
         let p = target_prefix.path().join(&paths.relative_path);
         match tokio_fs::remove_file(&p).await {
             Ok(_) => {}
@@ -204,10 +230,15 @@ pub async fn unlink_package(
         }
     }
 
-    // Remove the conda-meta file
-    let conda_meta_path = target_prefix
-        .join("conda-meta")
-        .join(prefix_record.file_name());
+    // Remove the conda-meta file. `prefix_record.file_name()` is
+    // metadata-derived too -- a malicious channel could ship a
+    // record whose `file_name` contains `..`, so guard it.
+    let conda_meta_dir = target_prefix.path().join("conda-meta");
+    let conda_meta_relative = PathBuf::from(prefix_record.file_name());
+    if rattler_fs_safety::validate_relative_inside(&conda_meta_dir, &conda_meta_relative).is_err() {
+        return Err(UnlinkError::RelativePathEscapesPrefix(conda_meta_relative));
+    }
+    let conda_meta_path = conda_meta_dir.join(&conda_meta_relative);
 
     match tokio_fs::remove_file(&conda_meta_path).await {
         Ok(_) => {}
