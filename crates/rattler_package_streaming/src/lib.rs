@@ -12,6 +12,8 @@ use rattler_digest::{Md5Hash, Sha256Hash};
 use rattler_redaction::Redact;
 
 pub mod read;
+#[cfg(not(target_arch = "wasm32"))]
+mod safe_unpack;
 pub mod seek;
 
 #[cfg(feature = "reqwest")]
@@ -71,6 +73,15 @@ pub enum ExtractError {
 
     #[error("could not parse archive member {0}: {1}")]
     ArchiveMemberParseError(PathBuf, #[source] std::io::Error),
+
+    /// The archive contains an entry whose path (or symlink target)
+    /// would land outside the extraction destination -- typically a
+    /// `..` escape, an absolute path, or a symlink that resolves
+    /// outside the destination root. Extraction is aborted before
+    /// any further entries are processed; the destination is left
+    /// in whatever partial state earlier entries produced.
+    #[error("archive entry would escape the extraction destination: {0}")]
+    UnsafeArchivePath(PathBuf),
 }
 
 impl From<ZipError> for ExtractError {

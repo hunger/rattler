@@ -5619,6 +5619,7 @@ dependencies = [
  "num_cpus",
  "rattler_conda_types",
  "rattler_digest",
+ "rattler_fs_safety",
  "rattler_networking",
  "rattler_redaction",
  "reqwest",

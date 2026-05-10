@@ -30,7 +30,8 @@ pub fn extract_tar_bz2(
     std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
 
     process_with_hashing(reader, |reader| {
-        stream_tar_bz2(reader).unpack(destination)?;
+        let mut archive = stream_tar_bz2(reader);
+        unpack_archive(&mut archive, destination)?;
         Ok(())
     })
 }
@@ -77,6 +78,28 @@ pub fn extract_conda_via_buffering(
     })
 }
 
+/// Cross-platform shim around tar extraction. Native targets
+/// (Linux, macOS, Windows) route through
+/// [`crate::safe_unpack::unpack_safely`], which anchors writes
+/// to a [`cap_std::fs::Dir`] capability and refuses entries
+/// whose paths or symlink targets would escape `destination`.
+/// `wasm32` falls back to [`tar::Archive::unpack`] until cap-std
+/// gains stable WASI support.
+fn unpack_archive<R: Read>(
+    archive: &mut tar::Archive<R>,
+    destination: &Path,
+) -> Result<(), ExtractError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::safe_unpack::unpack_safely(archive, destination)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        archive.unpack(destination)?;
+        Ok(())
+    }
+}
+
 fn extract_zipfile<R: std::io::Read>(
     zip_file: ZipFile<'_, R>,
     destination: &Path,
@@ -92,7 +115,8 @@ fn extract_zipfile<R: std::io::Read>(
         .map(OsStr::to_string_lossy)
         .is_some_and(|file_name| file_name.ends_with(".tar.zst"))
     {
-        stream_tar_zst(&mut *file)?.unpack(destination)?;
+        let mut archive = stream_tar_zst(&mut *file)?;
+        unpack_archive(&mut archive, destination)?;
     } else {
         // Manually read to the end of the stream if that didn't happen.
         std::io::copy(&mut *file, &mut std::io::sink())?;
