@@ -529,32 +529,42 @@ New:
         to_clobbers: &[(PathBuf, PackageName)],
         from_clobbers: &[(PathBuf, PackageName)],
     ) -> io::Result<()> {
-        fn mv(src: PathBuf, dst: PathBuf) -> io::Result<()> {
+        /// Atomic "rename only if `dst` doesn't already exist."
+        /// `hard_link` is the cross-platform-portable spelling of
+        /// the operation: the kernel-level `linkat(2)` (and
+        /// `CreateHardLinkW` on Windows) returns `EEXIST` when
+        /// `dst` is present, with no race window between the
+        /// existence check and the create -- closing the previous
+        /// `check_file_exists(&dst)`-then-`fs::rename` TOCTOU.
+        /// After the link succeeds, `src` and `dst` share an
+        /// inode; unlinking `src` completes the move.
+        ///
+        /// Same skip semantics as the previous code: if `src` is
+        /// missing or `dst` already exists, return `Ok(())` and
+        /// move on rather than erroring.
+        fn try_move_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
             tracing::trace!("Moving from {} to {}", src.display(), dst.display());
             if let Some(p) = dst.parent() {
                 fs::create_dir_all(p)?;
             }
-            fs::rename(src, dst)
-        }
-
-        fn check_file_exists(path: &Path) -> bool {
-            path.symlink_metadata().is_ok()
+            match fs::hard_link(src, dst) {
+                Ok(()) => fs::remove_file(src),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
         }
 
         for (p, pkg) in to_clobbers {
             let src = target_prefix.join(p);
             let dst = clobbers_dir.join::<&Path>(pkg.as_ref()).join(p);
-            if check_file_exists(&src) && !check_file_exists(&dst) {
-                mv(src, dst)?;
-            }
+            try_move_no_replace(&src, &dst)?;
         }
 
         for (p, pkg) in from_clobbers {
             let src = clobbers_dir.join::<&Path>(pkg.as_ref()).join(p);
             let dst = target_prefix.join(p);
-            if check_file_exists(&src) && !check_file_exists(&dst) {
-                mv(src, dst)?;
-            }
+            try_move_no_replace(&src, &dst)?;
         }
 
         Ok(())
@@ -963,6 +973,46 @@ mod tests {
             .read_to_string(&mut buf)
             .unwrap();
         assert_eq!(buf, "pkg1");
+    }
+
+    /// `sync_clobbers` is supposed to skip a move (rather than
+    /// overwrite) when the destination already exists. With the
+    /// new `hard_link`-then-`remove_file` implementation the
+    /// "skip" is enforced atomically by the kernel returning
+    /// `EEXIST`; this test pins that behaviour.
+    #[test]
+    fn test_sync_clobbers_skips_when_dst_exists() {
+        let tmp = TempDir::new().unwrap();
+        let target_prefix = tmp.path();
+        let clobbers = tmp.path().join("__clobbers__");
+        fs::create_dir_all(target_prefix).unwrap();
+        fs::create_dir_all(clobbers.join("pkg1")).unwrap();
+
+        // Pre-stage both source and destination of a clobber move
+        // with distinct contents. After `sync_clobbers` runs, the
+        // destination's content must be the one we pre-staged
+        // there -- i.e. the move was skipped because dst exists.
+        let src = target_prefix.join("collide.txt");
+        let dst = clobbers.join("pkg1").join("collide.txt");
+        File::create(&src).unwrap().write_all(b"src").unwrap();
+        File::create(&dst)
+            .unwrap()
+            .write_all(b"existing-dst")
+            .unwrap();
+
+        let to_clobbers = vec![(PathBuf::from("collide.txt"), "pkg1".into())];
+
+        PathResolver::sync_clobbers(target_prefix, &clobbers, &to_clobbers, &[]).unwrap();
+
+        let mut buf = String::new();
+        File::open(&dst).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(
+            buf, "existing-dst",
+            "sync_clobbers must not overwrite an existing destination"
+        );
+        // src is untouched too -- `hard_link` failed before any
+        // unlink fired.
+        assert!(src.exists(), "src should remain when move was skipped");
     }
 
     // TODO: Write more tests for unregister.
