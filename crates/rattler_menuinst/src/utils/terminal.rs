@@ -15,17 +15,27 @@ pub fn run_pre_create_command(pre_create_command: &str) -> Result<(), crate::Men
     use std::os::unix::fs::PermissionsExt;
     use std::{io::Write, process::Command};
 
-    use fs_err as fs;
-
     use crate::MenuInstError;
 
     let mut temp_file = tempfile::NamedTempFile::with_suffix(".sh")?;
     temp_file.write_all(pre_create_command.as_bytes())?;
+
+    let runs_directly = pre_create_command.starts_with("!#");
+    if runs_directly {
+        // `fchmod` on the still-open file descriptor -- no path
+        // resolution, no race window. Doing the chmod through
+        // `set_permissions(&path, ...)` after `into_temp_path()`
+        // would let a co-tenant race a symlink swap of the
+        // tempfile path under `$TMPDIR`.
+        temp_file
+            .as_file_mut()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+
     let temp_path = temp_file.into_temp_path();
 
     // Mark the file as executable or run it with bash
-    let mut cmd = if pre_create_command.starts_with("!#") {
-        fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755))?;
+    let mut cmd = if runs_directly {
         Command::new(&temp_path)
     } else {
         let mut cmd = Command::new("bash");
