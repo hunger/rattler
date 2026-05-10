@@ -94,6 +94,15 @@ pub enum PackageEntryValidationError {
     /// The SHA256 hash of the file does not match the expected hash.
     #[error("sha256 hash mismatch, expected '{0}' but file on disk is '{1}'")]
     HashMismatch(String, String),
+
+    /// The entry's `relative_path` would resolve outside the
+    /// package directory. Refused before any `File::open`, so a
+    /// malicious channel can't use a `paths.json` entry like
+    /// `../../etc/shadow` to probe whether a sensitive host file
+    /// exists (the `HashMismatch`-vs-`NotFound` distinction
+    /// would otherwise leak that information).
+    #[error("entry's relative path escapes the package directory")]
+    UnsafeRelativePath,
 }
 
 /// Determine whether the files in the specified directory match what is
@@ -109,14 +118,25 @@ pub fn validate_package_directory(
     package_dir: &Path,
     mode: ValidationMode,
 ) -> Result<(IndexJson, PathsJson), PackageValidationError> {
-    // Validate that there is a valid IndexJson
-    let index_json = IndexJson::from_package_directory(package_dir)
-        .map_err(PackageValidationError::ReadIndexJsonError)?;
+    // Open `package_dir` as a cap-std capability so subsequent
+    // `info/index.json` / `info/paths.json` reads route through
+    // the dir-fd. A co-tenant who swaps `package_dir` (or its
+    // `info/` subdir) for a symlink mid-validation can no longer
+    // steer the reads at e.g. `/etc/shadow`; cap-std refuses
+    // path-component symlinks that escape the directory.
+    let dir = rattler_fs_safety::Dir::open_ambient_dir(
+        package_dir,
+        rattler_fs_safety::ambient_authority(),
+    )
+    .map_err(PackageValidationError::ReadIndexJsonError)?;
+
+    let index_json =
+        read_package_file::<IndexJson>(&dir).map_err(PackageValidationError::ReadIndexJsonError)?;
 
     // Read the 'paths.json' file which describes all files that should be present.
     // If the file could not be found try reconstructing the paths information
     // from deprecated files in the package directory.
-    let paths = match PathsJson::from_package_directory(package_dir) {
+    let paths = match read_package_file::<PathsJson>(&dir) {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             match PathsJson::from_deprecated_package_directory(package_dir) {
                 Ok(paths) => paths,
@@ -141,6 +161,18 @@ pub fn validate_package_directory(
         .map_err(|(path, err)| PackageValidationError::CorruptedEntry(path, err))?;
 
     Ok((index_json, paths))
+}
+
+/// Read `T::package_path()` (e.g. `info/index.json`) from
+/// `dir` and parse it through [`PackageFile::from_reader`].
+/// Routing the read through the [`Dir`] capability ensures the
+/// file's parent path components are resolved against the open
+/// fd rather than fresh path walks, closing the symlink-swap
+/// window between `validate_package_directory`'s entry and the
+/// individual subfile opens.
+fn read_package_file<T: PackageFile>(dir: &rattler_fs_safety::Dir) -> std::io::Result<T> {
+    let file = dir.open(T::package_path())?;
+    T::from_reader(BufReader::new(file))
 }
 
 /// Determine whether the files in the specified directory match wat is expected
@@ -168,6 +200,15 @@ fn validate_package_entry(
     entry: &PathsEntry,
     mode: ValidationMode,
 ) -> Result<(), PackageEntryValidationError> {
+    // Refuse a `relative_path` that lexically resolves outside
+    // `package_dir`. Without this guard, a malicious channel
+    // could ship a `paths.json` entry like `../../etc/shadow`
+    // and have the downstream `File::open` probe leak whether
+    // that host file exists (via the `HashMismatch`-vs-
+    // `NotFound` distinction).
+    if rattler_fs_safety::validate_relative_inside(package_dir, &entry.relative_path).is_err() {
+        return Err(PackageEntryValidationError::UnsafeRelativePath);
+    }
     let path = package_dir.join(&entry.relative_path);
 
     // Validate based on the type of path
@@ -286,9 +327,10 @@ fn validate_package_directory_entry(
 #[cfg(test)]
 mod test {
     use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     use assert_matches::assert_matches;
-    use rattler_conda_types::package::{PackageFile, PathType, PathsJson};
+    use rattler_conda_types::package::{PackageFile, PathType, PathsEntry, PathsJson};
     use rstest::rstest;
     use url::Url;
 
@@ -414,6 +456,31 @@ mod test {
         assert_matches!(
             validate_package_directory(temp_dir.path(), ValidationMode::Full),
             Err(PackageValidationError::ReadIndexJsonError(_))
+        );
+    }
+
+    /// A `paths.json` entry whose `relative_path` lexically escapes
+    /// the package directory must be rejected before any `File::open`,
+    /// so the `HashMismatch`/`NotFound` distinction can't be used to
+    /// probe for sensitive host files.
+    #[test]
+    fn test_relative_path_escape_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let paths = PathsJson {
+            paths_version: 1,
+            paths: vec![PathsEntry {
+                relative_path: PathBuf::from("../../etc/shadow"),
+                no_link: false,
+                path_type: PathType::HardLink,
+                prefix_placeholder: None,
+                sha256: None,
+                size_in_bytes: None,
+            }],
+        };
+        assert_matches!(
+            validate_package_directory_from_paths(temp_dir.path(), &paths, ValidationMode::Full),
+            Err((path, PackageEntryValidationError::UnsafeRelativePath))
+                if path == Path::new("../../etc/shadow")
         );
     }
 }
