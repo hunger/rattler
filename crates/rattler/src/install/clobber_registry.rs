@@ -254,21 +254,34 @@ impl ClobberRegistry {
 
         for idx in prefix_records_to_rewrite {
             let record = &prefix_records[*idx];
-            tracing::debug!(
-                "writing updated prefix record to: {:?}",
-                conda_meta_path.join(record.file_name())
-            );
-            record
-                .write_to_path(conda_meta_path.as_path().join(record.file_name()), true)
-                .map_err(|e| {
-                    ClobberError::IoError(
-                        format!(
-                            "failed to write updated prefix record {}",
-                            record.file_name()
-                        ),
-                        e,
-                    )
-                })?;
+            // Refuse a `record.file_name()` containing path
+            // separators, `..`, or anything else that would land
+            // outside `conda-meta/`. The filename is metadata-
+            // derived, so a malicious channel could otherwise
+            // steer the write at e.g. `../../etc/cron.d/x`.
+            let dest = rattler_fs_safety::validate_relative_inside(
+                &conda_meta_path,
+                Path::new(&record.file_name()),
+            )
+            .map_err(|e| {
+                ClobberError::IoError(
+                    format!(
+                        "rejected unsafe prefix-record file_name: {}",
+                        record.file_name()
+                    ),
+                    e,
+                )
+            })?;
+            tracing::debug!("writing updated prefix record to: {:?}", dest);
+            record.write_to_path(&dest, true).map_err(|e| {
+                ClobberError::IoError(
+                    format!(
+                        "failed to write updated prefix record {}",
+                        record.file_name()
+                    ),
+                    e,
+                )
+            })?;
         }
 
         Ok(())
@@ -1619,5 +1632,60 @@ mod tests {
                 "__clobbers__/clobber-3/another-clobber.txt",
             ],
         );
+    }
+
+    /// `update_conda_meta` writes one JSON file per record under
+    /// `<prefix>/conda-meta/<file_name>`. The filename is metadata-
+    /// derived from `name-version-build`; a malicious channel could
+    /// ship a record with a `build` containing path separators or
+    /// `..` and steer the write outside `conda-meta/`.
+    #[test]
+    fn test_update_conda_meta_rejects_escaping_file_name() {
+        use rattler_conda_types::{PackageName, PackageRecord, PrefixRecord, RepoDataRecord};
+        use std::collections::{HashMap, HashSet};
+        use url::Url;
+
+        let prefix_dir = tempfile::tempdir().unwrap();
+        let conda_meta = prefix_dir.path().join("conda-meta");
+        fs::create_dir_all(&conda_meta).unwrap();
+
+        // `build = "a/../../escape"` makes `file_name()` produce
+        // `evil-1.0.0-a/../../escape.json`. Path components on Unix:
+        // `evil-1.0.0-a`, `..`, `..`, `escape.json` -- the second `..`
+        // can't be popped, so `validate_relative_inside` rejects it.
+        // (`build` is the only PackageRecord field with no path
+        // sanitisation; `name` and `version` parse-validate.)
+        let pkg_record = PackageRecord::new(
+            PackageName::from_str("evil").unwrap(),
+            Version::from_str("1.0.0").unwrap(),
+            "a/../../escape".to_string(),
+        );
+        let repodata_record = RepoDataRecord {
+            package_record: pkg_record,
+            identifier: "evil-1.0.0-x.tar.bz2".parse().unwrap(),
+            url: Url::parse("https://example.invalid/evil.tar.bz2").unwrap(),
+            channel: None,
+        };
+        let prefix_record = PrefixRecord::from_repodata_record(repodata_record, vec![]);
+
+        let mut prefix_records: HashMap<&str, PrefixRecord> = HashMap::new();
+        prefix_records.insert("evil", prefix_record);
+        let mut to_rewrite = HashSet::new();
+        to_rewrite.insert("evil");
+
+        let err = super::ClobberRegistry::update_conda_meta(
+            prefix_dir.path(),
+            &prefix_records,
+            &to_rewrite,
+        )
+        .unwrap_err();
+        let super::ClobberError::IoError(msg, _) = err;
+        assert!(
+            msg.contains("rejected unsafe prefix-record file_name"),
+            "{msg}"
+        );
+
+        // The escape did not touch the filesystem outside `conda-meta`.
+        assert!(!prefix_dir.path().join("escape.json").exists());
     }
 }
