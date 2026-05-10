@@ -5291,6 +5291,7 @@ dependencies = [
  "parking_lot",
  "rattler_conda_types",
  "rattler_digest",
+ "rattler_fs_safety",
  "rattler_networking",
  "rattler_package_streaming",
  "rattler_redaction",
@@ -5307,6 +5308,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

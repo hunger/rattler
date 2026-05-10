@@ -18,8 +18,10 @@ use crate::package_cache::PackageCacheLayerError;
 /// This struct represents a cache entry that has been validated and is ready for use.
 /// It holds the cache entry's path, revision number, and optional SHA256 hash.
 ///
-/// Note: Concurrent access is coordinated via the global cache lock mechanism
-/// (see [`CacheGlobalLock`]). Individual cache entries do not hold locks.
+/// Concurrent access is serialised by [`CacheMetadataFile`], which
+/// takes an exclusive `flock` on the entry's `.lock` file for the
+/// duration of validate-or-fetch. A [`CacheGlobalLock`] can
+/// additionally be held to amortise overhead across many entries.
 pub struct CacheMetadata {
     pub(super) revision: u64,
     pub(super) sha256: Option<Sha256Hash>,
@@ -61,10 +63,14 @@ impl CacheMetadata {
     }
 }
 
-/// A global lock for the entire package cache.
+/// A coarse advisory lock covering the entire package cache.
 ///
-/// This can be used to reduce lock overhead when performing many package
-/// operations by acquiring a single global lock instead of individual per-package locks.
+/// Per-entry locking is handled unconditionally by
+/// [`CacheMetadataFile`], so the global lock is **not** required
+/// for correctness against concurrent writers. It remains useful
+/// when a caller wants a single point of mutual exclusion across
+/// many entries -- for instance during a cache-wide maintenance
+/// pass -- without taking per-entry locks one by one as it walks.
 pub struct CacheGlobalLock {
     file: std::fs::File,
 }
@@ -90,21 +96,15 @@ impl CacheGlobalLock {
     pub async fn acquire(path: &Path) -> Result<Self, PackageCacheLayerError> {
         let lock_file_path = path.to_path_buf();
         let acquire_lock_fut = simple_spawn_blocking::tokio::run_blocking_task(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .read(true)
-                .open(&lock_file_path)
-                .map_err(|e| {
-                    PackageCacheLayerError::LockError(
-                        format!(
-                            "failed to open global cache lock for writing: '{}'",
-                            lock_file_path.display()
-                        ),
-                        e,
-                    )
-                })?;
+            let file = open_lock_file_no_follow(&lock_file_path).map_err(|e| {
+                PackageCacheLayerError::LockError(
+                    format!(
+                        "failed to open global cache lock for writing: '{}'",
+                        lock_file_path.display()
+                    ),
+                    e,
+                )
+            })?;
 
             file.lock_exclusive().map_err(move |e| {
                 PackageCacheLayerError::LockError(
@@ -130,44 +130,74 @@ impl CacheGlobalLock {
 
 /// A handle to a cache metadata file.
 ///
-/// This struct manages access to a `.lock` file that stores metadata about a cache entry,
-/// including its revision number and optional SHA256 hash. It does not provide filesystem
-/// locking - concurrent access should be coordinated via [`CacheGlobalLock`].
+/// This struct manages access to a `.lock` file that stores
+/// metadata about a cache entry -- its revision number and
+/// optional SHA256 hash. `acquire` takes an **exclusive
+/// `flock`** on the file before returning, so concurrent
+/// `PackageCache` instances in the same process (or separate
+/// processes) sharing the same cache root serialize on this lock
+/// rather than racing each other through `validate_package_common`.
+/// The lock is released when the file is dropped (the kernel
+/// releases all advisory locks held by an fd when it's closed).
 pub struct CacheMetadataFile {
     file: Arc<std::fs::File>,
 }
 
 impl CacheMetadataFile {
-    /// Acquires a handle to the cache metadata file.
+    /// Acquires the cache metadata file *and* takes an exclusive
+    /// `flock` on it.
     ///
-    /// Opens the file with both read and write permissions. Since concurrent access
-    /// is coordinated via [`CacheGlobalLock`], this single method is sufficient for
-    /// all metadata operations.
+    /// Two callers asking for the same entry's metadata file run
+    /// sequentially: the second one blocks inside `lock_exclusive`
+    /// until the first drops its handle. Different entries use
+    /// different lock files, so they don't contend.
+    ///
+    /// The optional [`CacheGlobalLock`] is still useful when a
+    /// caller wants to amortise locking overhead across many
+    /// per-entry operations, but it's no longer required for
+    /// correctness against concurrent writers -- this per-entry
+    /// `flock` is the new floor.
     pub async fn acquire(path: &Path) -> Result<Self, PackageCacheLayerError> {
         let lock_file_path = path.to_path_buf();
 
         simple_spawn_blocking::tokio::run_blocking_task(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_file_path)
-                .map_err(|e| {
-                    PackageCacheLayerError::LockError(
-                        format!(
-                            "failed to open cache metadata file: '{}'",
-                            lock_file_path.display()
-                        ),
-                        e,
-                    )
-                })?;
+            let file = open_lock_file_no_follow(&lock_file_path).map_err(|e| {
+                PackageCacheLayerError::LockError(
+                    format!(
+                        "failed to open cache metadata file: '{}'",
+                        lock_file_path.display()
+                    ),
+                    e,
+                )
+            })?;
+
+            file.lock_exclusive().map_err(|e| {
+                PackageCacheLayerError::LockError(
+                    format!(
+                        "failed to acquire exclusive lock on cache metadata file: '{}'",
+                        lock_file_path.display()
+                    ),
+                    e,
+                )
+            })?;
 
             Ok(CacheMetadataFile {
                 file: Arc::new(file),
             })
         })
         .await
+    }
+}
+
+impl Drop for CacheMetadataFile {
+    fn drop(&mut self) {
+        // Best-effort `flock` release. The kernel will release
+        // the advisory lock anyway when the fd is closed (which
+        // happens when the last `Arc<File>` is dropped), but
+        // doing it explicitly here makes the lock lifetime
+        // obvious to readers and lets other waiters proceed as
+        // soon as we're done rather than at fd-close time.
+        let _ = fs4::fs_std::FileExt::unlock(&*self.file);
     }
 }
 
@@ -301,6 +331,43 @@ async fn warn_timeout_future(message: String) {
     }
 }
 
+/// Open `lock_file_path` with `O_NOFOLLOW` semantics so a
+/// preplanted symlink at the final component can't redirect the
+/// open at a sensitive file. The cache root may be shared with
+/// untrusted local users; without this guard, a co-tenant who
+/// placed `<entry>.lock` as a symlink to `~/.bashrc` could have
+/// `CacheMetadataFile::write_revision_and_sha` truncate-and-
+/// overwrite that target with binary revision/sha bytes.
+///
+/// Routed through `rattler_fs_safety::open_no_follow` which uses
+/// a `cap_std::fs::Dir` capability on every platform rattler
+/// supports (cross-platform symlink-refusal cheaper than a
+/// Unix-only `OpenOptionsExt::custom_flags(O_NOFOLLOW)`).
+fn open_lock_file_no_follow(lock_file_path: &Path) -> std::io::Result<std::fs::File> {
+    let parent = lock_file_path.parent().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "lock file path has no parent: {}",
+            lock_file_path.display()
+        ))
+    })?;
+    let name = lock_file_path.file_name().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "lock file path has no final component: {}",
+            lock_file_path.display()
+        ))
+    })?;
+    let cap_file = rattler_fs_safety::open_no_follow(
+        parent,
+        name,
+        rattler_fs_safety::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true),
+    )?;
+    Ok(cap_file.into_std())
+}
+
 #[cfg(test)]
 mod tests {
     use rattler_digest::{parse_digest_from_hex, Sha256};
@@ -327,5 +394,42 @@ mod tests {
         assert_eq!(revision, 1);
         let read_sha = metadata.read_sha256().unwrap();
         assert_eq!(sha, read_sha);
+    }
+
+    /// Two concurrent `CacheMetadataFile::acquire` calls on the
+    /// same path must serialise: the second one blocks until the
+    /// first handle is dropped. Deleting the `lock_exclusive` call
+    /// in `acquire` makes this test fail (the second handle
+    /// returns immediately while the first is still alive).
+    #[tokio::test]
+    async fn acquire_serialises_concurrent_callers() {
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let metadata_file = temp_dir.path().join("foo.lock");
+
+        let first = CacheMetadataFile::acquire(&metadata_file).await.unwrap();
+
+        let path_for_second = metadata_file.clone();
+        let second_task =
+            tokio::spawn(async move { CacheMetadataFile::acquire(&path_for_second).await });
+
+        // Give the second task a generous chance to reach the
+        // blocking `flock` call. If the lock weren't held the
+        // second acquire would complete within a few ms.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !second_task.is_finished(),
+            "second acquire should still be blocked while the first handle is live"
+        );
+
+        drop(first);
+
+        let second = tokio::time::timeout(Duration::from_secs(5), second_task)
+            .await
+            .expect("second acquire did not complete after the first handle was dropped")
+            .expect("second-acquire task panicked")
+            .expect("second acquire returned an error");
+        drop(second);
     }
 }

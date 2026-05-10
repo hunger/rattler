@@ -28,11 +28,16 @@ itertools = { workspace = true }
 parking_lot = { workspace = true }
 rattler_conda_types = { workspace = true, default-features = false }
 rattler_digest = { workspace = true, default-features = false }
+rattler_fs_safety = { workspace = true }
 rattler_redaction = { workspace = true, default-features = false }
 rattler_networking = { workspace = true, default-features = false }
 rattler_package_streaming = { workspace = true, default-features = false, features = ["reqwest"] }
 reqwest = { workspace = true, features = ["stream"] }
 tempfile = { workspace = true }
+# Random per-call temp-directory names so the cache's
+# `tempdir_in` slot can be opened through a cap-std `Dir`
+# capability rather than re-resolved by path on every step.
+uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true, features = ["macros"] }
 tracing = { workspace = true }
 url = { workspace = true }
