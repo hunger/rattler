@@ -107,7 +107,17 @@ pub fn run_link_scripts<'a>(
         let prec = &record.repodata_record.package_record;
         let link_file = target_prefix.join(link_script_type.get_path(prec, platform));
 
-        if link_file.exists() {
+        // `exists` follows symlinks; if the link-script path is a
+        // symlink to a binary outside the prefix, we'd happily
+        // execute that. `symlink_metadata` checks the path itself
+        // without following -- a symlink at `link_file` is treated
+        // as "not a script" rather than "execute whatever's on
+        // the other end".
+        let link_file_meta = link_file.symlink_metadata();
+        if link_file_meta
+            .as_ref()
+            .is_ok_and(|m| m.file_type().is_file())
+        {
             env.insert(
                 "PKG_NAME".to_string(),
                 prec.name.as_normalized().to_string(),
