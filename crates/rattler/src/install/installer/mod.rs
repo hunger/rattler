@@ -886,10 +886,12 @@ fn update_requested_specs_in_json(
         }
     }
 
-    // Write the updated JSON back to file
+    // Write the updated JSON back to file via temp+rename so a
+    // concurrent reader never sees a torn document and a co-tenant
+    // can't redirect the write through a final-component symlink.
     let updated_content = serde_json::to_string_pretty(&json)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs_err::write(path, updated_content)?;
+    rattler_fs_safety::atomic_write(path, updated_content.as_bytes(), None)?;
 
     Ok(())
 }
