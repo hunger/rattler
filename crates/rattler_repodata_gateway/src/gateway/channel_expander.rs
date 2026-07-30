@@ -620,6 +620,18 @@ enum ResolveError {
     Unparsable(url::ParseError),
 }
 
+/// Resolve a [CEP-42] `base`/`overrides` reference the way the query path
+/// does, or `None` if the reference is one the gateway refuses.
+///
+/// Exposed so tools that inspect relations outside a query resolve references
+/// identically -- the validation is security-sensitive, so a second
+/// implementation would be a place for the two to drift apart.
+///
+/// [CEP-42]: https://github.com/conda/ceps/blob/main/cep-0042.md
+pub fn resolve_channel_relation(declaring: &ChannelUrl, reference: &str) -> Option<ChannelUrl> {
+    validate_and_resolve(declaring, reference).ok()
+}
+
 /// Validate `reference` as a CEP-42 relative path and resolve it
 /// against `declaring`. Strictness keeps malicious metadata from
 /// pointing at attacker-controlled URLs.

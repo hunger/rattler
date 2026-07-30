@@ -26,7 +26,9 @@ use crate::{Reporter, gateway::subdir_builder::SubdirBuilder};
 pub use barrier_cell::BarrierCell;
 pub use builder::{GatewayBuilder, MaxConcurrency};
 pub use channel_config::{ChannelConfig, SourceConfig};
-pub use channel_expander::{ChannelRelationsMode, ChannelRelationsWarning};
+pub use channel_expander::{
+    ChannelRelationsMode, ChannelRelationsWarning, resolve_channel_relation,
+};
 pub use channel_relations::DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH;
 use coalesced_map::{CoalescedGetError, CoalescedMap};
 pub use error::GatewayError;

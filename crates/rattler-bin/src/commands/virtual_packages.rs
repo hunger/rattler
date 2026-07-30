@@ -1,7 +1,15 @@
+#[cfg(feature = "experimental-virtual-package-plugins")]
+use indexmap::IndexMap;
+#[cfg(feature = "experimental-virtual-package-plugins")]
+use itertools::Itertools;
 use miette::IntoDiagnostic;
 use rattler_conda_types::GenericVirtualPackage;
 #[cfg(feature = "experimental-virtual-package-plugins")]
-use rattler_conda_types::Platform;
+use rattler_conda_types::{Channel, ChannelConfig, PackageName, Platform};
+#[cfg(feature = "experimental-virtual-package-plugins")]
+use rattler_repodata_gateway::{
+    DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH, Gateway, resolve_channel_relation,
+};
 use rattler_virtual_packages::VirtualPackageOverrides;
 
 /// Print detected virtual packages.
@@ -10,7 +18,8 @@ use rattler_virtual_packages::VirtualPackageOverrides;
     feature = "experimental-virtual-package-plugins",
     clap(after_help = r#"Examples:
   rattler virtual-packages
-  rattler virtual-packages -c ./test-data/channels/virtual-package-plugins"#)
+  rattler virtual-packages -c ./test-data/channels/virtual-package-plugins
+  rattler virtual-packages -c ./test-data/channels/virtual-package-plugins-derived"#)
 )]
 pub struct Opt {
     /// Channels to list registered virtual package plugins for
@@ -51,9 +60,7 @@ async fn print_plugins(
 ) -> miette::Result<()> {
     use std::{collections::HashMap, env};
 
-    use itertools::Itertools;
-    use rattler_conda_types::{Channel, ChannelConfig, PackageName};
-    use rattler_repodata_gateway::{Gateway, SourceConfig};
+    use rattler_repodata_gateway::SourceConfig;
 
     if channels.is_empty() {
         return Ok(());
@@ -86,26 +93,258 @@ async fn print_plugins(
 
     for channel in &channels {
         for platform in &platforms {
-            let plugins = gateway
-                .virtual_package_plugins(channel, *platform)
-                .await
-                .into_diagnostic()?;
-            if plugins.is_empty() {
+            let chain = base_chain(&gateway, channel, *platform).await?;
+            let claims = collect_claims(&gateway, &chain, *platform).await?;
+            if claims.is_empty() {
                 continue;
             }
+
             println!(
-                "\nvirtual package plugins in {} [{platform}]:",
+                "\nvirtual package plugins visible to {} [{platform}]:",
                 channel.canonical_name()
             );
-            for (plugin, provided) in &plugins {
+            for (virtual_package, claims) in &claims {
                 println!(
-                    "  {} provides {}",
-                    plugin.as_source(),
-                    provided.iter().map(PackageName::as_source).join(", ")
+                    "  {} from {}",
+                    virtual_package.as_source(),
+                    claims.iter().map(Claim::to_string).join(", ")
                 );
+            }
+
+            for warning in override_warnings(&claims) {
+                println!("  warning: {warning}");
             }
         }
     }
 
     Ok(())
+}
+
+/// Virtual packages every client detects itself, so a plugin registering one
+/// shadows a name the solver already fills in.
+///
+/// Names rather than a rattler API because [`rattler_virtual_packages`] exposes
+/// no enumeration: they live in the `From<VirtualPackage> for
+/// GenericVirtualPackage` impls. `standardized_names_stay_in_sync` guards the
+/// drift.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+const STANDARDIZED_VIRTUAL_PACKAGES: &[&str] = &[
+    "__unix",
+    "__linux",
+    "__win",
+    "__osx",
+    "__ios",
+    "__android",
+    "__glibc",
+    "__musl",
+    "__eglibc",
+    "__cuda",
+    "__cuda_arch",
+    "__archspec",
+];
+
+/// One channel's registration of one virtual package. `depth` is the distance
+/// along `base` edges from the channel asked about, so `0` is its own claim.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+struct Claim {
+    channel: String,
+    plugin: PackageName,
+    depth: usize,
+}
+
+#[cfg(feature = "experimental-virtual-package-plugins")]
+impl std::fmt::Display for Claim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.plugin.as_source(), self.channel)
+    }
+}
+
+/// The chain of channels `channel` inherits virtual packages from: itself
+/// first, then each [CEP-42] `base` in turn.
+///
+/// Only `base` is followed. It names the channel of higher priority that the
+/// declaring channel builds on, so its virtual packages are in scope; an
+/// `overrides` edge points the other way, at a channel being superseded.
+///
+/// References resolve through [`resolve_channel_relation`], so a reference the
+/// gateway would refuse is skipped here too, and one already in the chain ends
+/// the walk, which terminates a `base` cycle. The depth cap is CEP-42's own
+/// [`DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH`].
+///
+/// [CEP-42]: https://github.com/conda/ceps/blob/main/cep-0042.md
+#[cfg(feature = "experimental-virtual-package-plugins")]
+async fn base_chain(
+    gateway: &Gateway,
+    channel: &Channel,
+    platform: Platform,
+) -> miette::Result<Vec<Channel>> {
+    let mut chain = vec![channel.clone()];
+    let mut seen = std::collections::HashSet::from([channel.base_url.clone()]);
+
+    while chain.len() <= DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH {
+        let declaring = chain.last().expect("seeded above");
+        let Some(relations) = gateway
+            .channel_relations(declaring, platform)
+            .await
+            .into_diagnostic()?
+        else {
+            break;
+        };
+        let Some(base) = relations
+            .base
+            .as_deref()
+            .and_then(|base| resolve_channel_relation(&declaring.base_url, base))
+        else {
+            break;
+        };
+        if !seen.insert(base.clone()) {
+            break;
+        }
+        chain.push(Channel::from_url(base));
+    }
+
+    Ok(chain)
+}
+
+/// Every virtual package the chain registers, mapped to the claims on it in
+/// chain order, so a name claimed more than once carries all its claimants.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+async fn collect_claims(
+    gateway: &Gateway,
+    chain: &[Channel],
+    platform: Platform,
+) -> miette::Result<IndexMap<PackageName, Vec<Claim>>> {
+    let mut claims: IndexMap<_, Vec<Claim>> = IndexMap::new();
+
+    for (depth, channel) in chain.iter().enumerate() {
+        let plugins = gateway
+            .virtual_package_plugins(channel, platform)
+            .await
+            .into_diagnostic()?;
+        for (plugin, provided) in plugins {
+            for virtual_package in provided {
+                claims.entry(virtual_package).or_default().push(Claim {
+                    channel: channel.canonical_name(),
+                    plugin: plugin.clone(),
+                    depth,
+                });
+            }
+        }
+    }
+
+    claims.sort_keys();
+    Ok(claims)
+}
+
+/// Warnings for claims that shadow something already provided: a name a client
+/// detects itself, or one an inherited channel already registers.
+///
+/// What should happen instead is undecided (open question 7 of the plugin
+/// proposal), so this only reports.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+fn override_warnings(claims: &IndexMap<PackageName, Vec<Claim>>) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    for (virtual_package, claims) in claims {
+        let name = virtual_package.as_source();
+
+        if STANDARDIZED_VIRTUAL_PACKAGES.contains(&name) {
+            warnings.push(format!(
+                "{name} is a standardized virtual package that clients detect themselves, \
+                 but it is registered by {}",
+                claims.iter().map(Claim::to_string).join(", ")
+            ));
+        }
+
+        // Claims are in chain order, so anything past the first is inherited
+        // from further along `base` and is what the earlier claim shadows.
+        if let Some((first, shadowed)) = claims.split_first()
+            && !shadowed.is_empty()
+        {
+            warnings.push(format!(
+                "{name} is registered by {first}, overriding {}",
+                shadowed
+                    .iter()
+                    .map(|claim| if claim.depth == first.depth {
+                        format!("{claim} in the same channel")
+                    } else {
+                        format!("{claim} it inherits from")
+                    })
+                    .join(", ")
+            ));
+        }
+    }
+
+    warnings
+}
+
+#[cfg(all(test, feature = "experimental-virtual-package-plugins"))]
+mod tests {
+    use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
+
+    use super::*;
+
+    /// Guards [`STANDARDIZED_VIRTUAL_PACKAGES`] against rattler gaining a
+    /// virtual package it detects that this list doesn't know about -- an
+    /// unlisted name means a plugin could shadow it without a warning.
+    ///
+    /// Only covers names that appear in per-platform detection, so ones that
+    /// are never a default (`__cuda`, `__cuda_arch`, and the non-glibc libc
+    /// flavors) still have to be added by hand.
+    #[test]
+    fn standardized_names_stay_in_sync() {
+        let overrides = VirtualPackageOverrides::default();
+        for platform in [
+            Platform::Linux64,
+            Platform::LinuxAarch64,
+            Platform::Osx64,
+            Platform::OsxArm64,
+            Platform::Win64,
+            Platform::EmscriptenWasm32,
+        ] {
+            let detected = VirtualPackages::detect_for_platform(platform, &overrides)
+                .expect("detection for a known platform");
+            for package in detected.into_generic_virtual_packages() {
+                let name = package.name.as_source().to_string();
+                assert!(
+                    STANDARDIZED_VIRTUAL_PACKAGES.contains(&name.as_str()),
+                    "{platform} detects {name}, which STANDARDIZED_VIRTUAL_PACKAGES omits"
+                );
+            }
+        }
+    }
+
+    /// The claim on a name registered by both a channel and the channel it
+    /// inherits from is reported as an override, and a lone claim is not.
+    #[test]
+    fn only_shadowed_claims_warn() {
+        let claim = |channel: &str, plugin: &str, depth| Claim {
+            channel: channel.to_string(),
+            plugin: PackageName::new_unchecked(plugin),
+            depth,
+        };
+        let claims = IndexMap::from([
+            (
+                PackageName::new_unchecked("__rocm"),
+                vec![claim("derived", "rocm-detect", 0)],
+            ),
+            (
+                PackageName::new_unchecked("__vendor"),
+                vec![
+                    claim("derived", "vendor-detect", 0),
+                    claim("base", "base-detect", 1),
+                ],
+            ),
+        ]);
+
+        let warnings = override_warnings(&claims);
+        assert_eq!(warnings.len(), 1, "got {warnings:#?}");
+        assert!(
+            warnings[0].contains("__vendor")
+                && warnings[0].contains("overriding")
+                && warnings[0].contains("inherits from"),
+            "{}",
+            warnings[0]
+        );
+    }
 }
