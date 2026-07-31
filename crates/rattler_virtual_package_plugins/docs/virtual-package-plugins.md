@@ -458,6 +458,11 @@ hide what the others found. `--detect` takes a single platform, since detection 
 machine. Unlike the listing mode it does not walk the `base` chain: only plugins the named channels
 register themselves are run.
 
+A registration naming a package the channel does not have is reported as exactly that, rather than as a
+failure to resolve dependencies -- it is a disagreement between a channel's metadata and its packages, and
+no amount of dependency resolution will fix it. Where a failure does come from further down, the whole
+chain of causes is printed, not just the outermost message.
+
 Local fixtures to point it at, since no channel publishes the field yet:
 
 - `test-data/channels/virtual-package-plugins` registers `foobar-detect` for `__foobar` and

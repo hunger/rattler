@@ -45,6 +45,20 @@ pub enum EnvironmentError {
     #[error("failed to fetch repodata for the plugin")]
     Fetch(#[from] rattler_repodata_gateway::GatewayError),
 
+    /// The channel registers the plugin but ships no package providing it.
+    ///
+    /// Reported separately from a solve failure because it is a different
+    /// problem with a different fix: the channel's metadata and its packages
+    /// disagree, and no amount of dependency resolution will help.
+    #[error("the channel registers the plugin '{plugin}' but provides no such package")]
+    PluginPackageMissing {
+        /// The plugin the channel registered.
+        plugin: String,
+        /// The channel that registered it, for a caller that reports errors
+        /// away from where the channel is already named.
+        channel: String,
+    },
+
     /// The plugin and its dependencies could not be resolved.
     ///
     /// The solve deliberately sees only built-in virtual packages, so a plugin
@@ -127,6 +141,20 @@ pub async fn ensure_plugin_environment(
         .recursive(true)
         .execute()
         .await?;
+
+    // A registration naming a package the channel does not have is a mistake in
+    // the channel, and saying so beats letting the solver report an unsatisfiable
+    // dependency on a name the user never asked for.
+    if !repo_data
+        .iter()
+        .flat_map(rattler_repodata_gateway::RepoData::iter)
+        .any(|record| record.package_record.name == *plugin)
+    {
+        return Err(EnvironmentError::PluginPackageMissing {
+            plugin: plugin.as_source().to_string(),
+            channel: channel.canonical_name(),
+        });
+    }
 
     let virtual_packages = VirtualPackage::detect(&VirtualPackageOverrides::from_env())?
         .into_iter()

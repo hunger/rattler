@@ -119,19 +119,30 @@ async fn print_plugins(
             }
 
             println!(
-                "\nvirtual package plugins visible to {} [{platform}]:",
-                channel.canonical_name()
+                "\n{}{} {}",
+                console::Emoji("🔌 ", ""),
+                console::style(channel.canonical_name()).bold(),
+                console::style(format!("[{platform}]")).dim(),
             );
             for (virtual_package, claims) in &claims {
                 println!(
-                    "  {} from {}",
-                    virtual_package.as_source(),
-                    claims.iter().map(Claim::to_string).join(", ")
+                    "  {} {} {}",
+                    console::style(console::Emoji("•", "-")).cyan(),
+                    console::style(virtual_package.as_source()).bold(),
+                    console::style(format!(
+                        "from {}",
+                        claims.iter().map(Claim::to_string).join(", ")
+                    ))
+                    .dim(),
                 );
             }
 
             for warning in override_warnings(&claims) {
-                println!("  warning: {warning}");
+                println!(
+                    "  {} {}",
+                    console::style(console::Emoji("⚠", "!")).yellow(),
+                    console::style(warning).yellow(),
+                );
             }
         }
     }
@@ -243,7 +254,7 @@ async fn collect_claims(
         for (plugin, provided) in plugins {
             for virtual_package in provided {
                 claims.entry(virtual_package).or_default().push(Claim {
-                    channel: channel.canonical_name(),
+                    channel: short_channel_name(channel),
                     plugin: plugin.clone(),
                     depth,
                 });
@@ -429,8 +440,10 @@ async fn detect_plugins(
         }
 
         println!(
-            "\ndetecting virtual packages for {} [{platform}]:",
-            channel.canonical_name()
+            "\n{}{} {}",
+            console::Emoji("🔌 ", ""),
+            console::style(channel.canonical_name()).bold(),
+            console::style(format!("[{platform}]")).dim(),
         );
 
         for (plugin, declared) in &registrations {
@@ -451,25 +464,84 @@ async fn detect_plugins(
             match detection {
                 Ok(detection) => {
                     let source = if detection.from_cache {
-                        "cached"
+                        "from cache"
                     } else {
-                        "ran"
+                        "ran the plugin"
                     };
+                    println!(
+                        "  {} {} {}",
+                        console::style(console::Emoji("✔", "+")).green(),
+                        console::style(plugin.as_source()).bold(),
+                        console::style(format!("({source})")).dim(),
+                    );
                     if detection.virtual_packages.is_empty() {
                         println!(
-                            "  {} ({source}): none of {} are present",
-                            plugin.as_source(),
-                            declared.iter().map(PackageName::as_source).join(", ")
+                            "      {}",
+                            console::style(format!(
+                                "none of {} are present on this system",
+                                declared.iter().map(PackageName::as_source).join(", ")
+                            ))
+                            .dim(),
                         );
                     }
                     for detected in &detection.virtual_packages {
-                        println!("  {} ({source}): {}", plugin.as_source(), detected.package);
+                        println!("      {}", console::style(&detected.package).green());
                     }
                 }
-                Err(err) => println!("  {}: skipped, {err}", plugin.as_source()),
+                Err(err) => {
+                    println!(
+                        "  {} {} {}",
+                        console::style(console::Emoji("✖", "x")).red(),
+                        console::style(plugin.as_source()).bold(),
+                        console::style("(skipped)").dim(),
+                    );
+                    for line in explain(&err) {
+                        println!("      {}", console::style(line).red());
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// The message of an error and of every cause beneath it.
+///
+/// A detection failure is usually reported by an outer layer -- "could not
+/// prepare the environment" -- while the useful part is further down, so
+/// printing only the top message throws away the answer to "why".
+#[cfg(feature = "experimental-virtual-package-plugins")]
+fn explain(err: &dyn std::error::Error) -> Vec<String> {
+    let mut lines = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        // thiserror's `#[error(transparent)]` repeats the message it wraps.
+        if lines.last() != Some(&message) {
+            lines.push(message);
+        }
+        source = cause.source();
+    }
+    lines
+}
+
+/// A channel name short enough to repeat on every line.
+///
+/// A channel's canonical name is already short when it has an alias
+/// (`conda-forge`), but a local one is a whole `file://` URL. Detail lines repeat
+/// the channel once per claim, so the last path segment is used there; the header
+/// still prints the full name, which is what identifies it unambiguously.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+fn short_channel_name(channel: &Channel) -> String {
+    let canonical = channel.canonical_name();
+    if channel.base_url.url().scheme() != "file" {
+        return canonical;
+    }
+    channel
+        .base_url
+        .url()
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .map_or(canonical, ToString::to_string)
 }
