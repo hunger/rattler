@@ -3,10 +3,30 @@
     "subdir": "noarch",
     "base_url": "../noarch",
     "virtual_package_plugins": {
-      "cuda-detect": ["__cuda", "__cuda_arch"],
-      "rocm-detect": ["__rocm"]
+      "foobar-detect": [
+        "__foobar",
+        "__foobar_arch"
+      ],
+      "rocm-detect": [
+        "__rocm"
+      ]
     }
   },
   "packages.conda": {},
-  "repodata_version": 2
+  "repodata_version": 2,
+  "packages": {
+    "foobar-detect-1.0.0-h0000000_0.tar.bz2": {
+      "build": "h0000000_0",
+      "build_number": 0,
+      "depends": [],
+      "name": "foobar-detect",
+      "noarch": "generic",
+      "subdir": "noarch",
+      "timestamp": 1700000000000,
+      "version": "1.0.0",
+      "md5": "5d3916411423c678329e9071356d590a",
+      "sha256": "e437827e5d269a7c8f0417c25ce7cc92b486180ee8de0641e3c14150025ac7d2",
+      "size": 867
+    }
+  }
 }

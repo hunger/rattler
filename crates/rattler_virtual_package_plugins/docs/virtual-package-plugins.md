@@ -350,7 +350,14 @@ registration -- scaffolding to exercise the protocol and the contract before an 
 worth deleting once one does.
 
 Local fixtures to point it at, since no channel publishes the field yet:
-`test-data/channels/virtual-package-plugins`, plus `-base` and `-derived` for the inheritance case.
+
+- `test-data/channels/virtual-package-plugins` registers `foobar-detect` for `__foobar` and
+  `__foobar_arch` and ships a `noarch: generic` package providing it, whose entry point prints fixed
+  verdicts and exits zero. Synthetic names, so the fixture cannot collide with a virtual package clients
+  detect themselves and cannot be caught by a future policy on shadowing. It also registers
+  `rocm-detect` and deliberately ships no package for it, which exercises that error path.
+- `-base` and `-derived` cover inheritance, and deliberately do register `__cuda` and `__glibc`, since
+  provoking the shadowing warnings is what they are for.
 
 All of this is behind the `experimental-virtual-package-plugins` feature. With the feature off the
 gateway's public API and its serialized output are unchanged.
