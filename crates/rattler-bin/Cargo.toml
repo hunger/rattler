@@ -39,6 +39,7 @@ experimental-virtual-package-plugins = [
   "rattler_index/experimental-virtual-package-plugins",
   "dep:rattler_virtual_package_plugins",
   "rattler_virtual_package_plugins/experimental-virtual-package-plugins",
+  "rattler_cache/experimental-virtual-package-plugins",
 ]
 
 [dependencies]

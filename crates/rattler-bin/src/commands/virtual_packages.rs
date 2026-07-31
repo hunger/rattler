@@ -19,7 +19,8 @@ use rattler_virtual_packages::VirtualPackageOverrides;
     clap(after_help = r#"Examples:
   rattler virtual-packages
   rattler virtual-packages -c ./test-data/channels/virtual-package-plugins
-  rattler virtual-packages -c ./test-data/channels/virtual-package-plugins-derived"#)
+  rattler virtual-packages -c ./test-data/channels/virtual-package-plugins-derived
+  rattler virtual-packages -c ./test-data/channels/virtual-package-plugins --detect"#)
 )]
 pub struct Opt {
     /// Channels to list registered virtual package plugins for
@@ -32,15 +33,10 @@ pub struct Opt {
     #[clap(short, long)]
     platforms: Vec<Platform>,
 
-    /// Check a plugin's recorded output against what a channel registered it for
+    /// Run each registered plugin and report the virtual packages it detects
     #[cfg(feature = "experimental-virtual-package-plugins")]
-    #[clap(long, requires = "plugin", value_name = "PATH_OR_DASH")]
-    check_output: Option<String>,
-
-    /// Plugin package whose output --check-output holds
-    #[cfg(feature = "experimental-virtual-package-plugins")]
-    #[clap(long, requires = "check_output")]
-    plugin: Option<String>,
+    #[clap(long)]
+    detect: bool,
 }
 
 pub async fn virtual_packages(opt: Opt, offline: bool) -> miette::Result<()> {
@@ -52,8 +48,8 @@ pub async fn virtual_packages(opt: Opt, offline: bool) -> miette::Result<()> {
     }
 
     #[cfg(feature = "experimental-virtual-package-plugins")]
-    if let (Some(output), Some(plugin)) = (&opt.check_output, &opt.plugin) {
-        check_plugin_output(&opt.channels, &opt.platforms, offline, plugin, output).await?;
+    if opt.detect {
+        detect_plugins(&opt.channels, &opt.platforms, offline).await?;
     } else {
         print_plugins(&opt.channels, &opt.platforms, offline).await?;
     }
@@ -372,79 +368,107 @@ mod tests {
     }
 }
 
-/// Parses recorded plugin output and checks it against the virtual packages the
-/// channel registered that plugin for, without installing or running anything.
+/// Runs every plugin the given channels register and reports what each detected.
 ///
-/// This is how the protocol and contract can be exercised against real channel
-/// metadata before there is an executor to produce the output for real.
+/// A plugin that fails is reported and skipped rather than aborting the run: one
+/// broken plugin should not hide what the others found, and a system without the
+/// hardware is indistinguishable from a broken plugin at this level.
 #[cfg(feature = "experimental-virtual-package-plugins")]
-async fn check_plugin_output(
+async fn detect_plugins(
     channels: &[String],
     platforms: &[Platform],
     offline: bool,
-    plugin: &str,
-    output_path: &str,
 ) -> miette::Result<()> {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, env};
 
-    use miette::{Context, bail};
-    use rattler_virtual_package_plugins::{parse_output, validate};
+    use rattler_cache::{
+        default_cache_dir, package_cache::PackageCache,
+        virtual_package_plugin_cache::VirtualPackagePluginCache,
+    };
+    use rattler_virtual_package_plugins::{DetectOptions, detect_virtual_packages};
 
-    let [channel] = channels else {
-        bail!("--check-output needs exactly one -c/--channel");
-    };
-    let [platform] = platforms else {
-        bail!("--check-output needs exactly one -p/--platforms");
-    };
-
-    let stdout = if output_path == "-" {
-        std::io::read_to_string(std::io::stdin())
-            .into_diagnostic()
-            .context("failed to read plugin output from stdin")?
-    } else {
-        std::fs::read_to_string(output_path)
-            .into_diagnostic()
-            .with_context(|| format!("failed to read plugin output from '{output_path}'"))?
-    };
+    if channels.is_empty() {
+        return Ok(());
+    }
 
     let channel_config =
-        ChannelConfig::default_with_root_dir(std::env::current_dir().into_diagnostic()?);
-    let channel = Channel::from_str(channel, &channel_config).into_diagnostic()?;
-    let gateway = plugin_gateway(offline)?;
-
-    let plugin = PackageName::try_from(plugin).into_diagnostic()?;
-    let registrations = gateway
-        .virtual_package_plugins(&channel, *platform)
-        .await
+        ChannelConfig::default_with_root_dir(env::current_dir().into_diagnostic()?);
+    let channels = channels
+        .iter()
+        .map(|channel| Channel::from_str(channel, &channel_config))
+        .collect::<Result<Vec<_>, _>>()
         .into_diagnostic()?;
-    let Some(declared) = registrations.get(&plugin) else {
-        bail!(
-            "{} does not register a plugin named '{}' for {platform}",
-            channel.canonical_name(),
-            plugin.as_source()
-        );
+
+    // Detection inspects this machine, so only the host platform is meaningful.
+    let platform = match platforms {
+        [] => Platform::current(),
+        [platform] => *platform,
+        _ => miette::bail!("--detect works on one platform at a time"),
     };
-    let declared: BTreeSet<_> = declared.iter().cloned().collect();
 
-    println!(
-        "\nchecking '{}' against {} [{platform}], registered for {}",
-        plugin.as_source(),
-        channel.canonical_name(),
-        declared.iter().map(PackageName::as_source).join(", ")
+    let cache_dir = default_cache_dir()
+        .map_err(|e| miette::miette!("could not determine cache directory: {e}"))?;
+    rattler_cache::ensure_cache_dir(&cache_dir)
+        .map_err(|e| miette::miette!("could not create cache directory: {e}"))?;
+    let gateway = plugin_gateway(offline)?;
+    let package_cache = PackageCache::new(cache_dir.join(rattler_cache::PACKAGE_CACHE_DIR));
+    let detection_cache = VirtualPackagePluginCache::new(
+        cache_dir.join(rattler_cache::VIRTUAL_PACKAGE_PLUGINS_CACHE_DIR),
     );
+    let environment_root = cache_dir.join(rattler_cache::EXEC_ENVS_DIR).join("plugins");
+    // One timestamp for the whole run, so every plugin agrees on what now is.
+    let now = jiff::Timestamp::now().as_second();
 
-    let output = parse_output(&stdout).into_diagnostic()?;
-    validate(&declared, &output).into_diagnostic()?;
-
-    println!("  contract satisfied; detected:");
-    for verdict in &output.detections {
-        match verdict.to_generic() {
-            Some(package) => println!("    {package}"),
-            None => println!("    {} absent", verdict.name.as_source()),
+    for channel in &channels {
+        let registrations = gateway
+            .virtual_package_plugins(channel, platform)
+            .await
+            .into_diagnostic()?;
+        if registrations.is_empty() {
+            continue;
         }
-    }
-    if let Some(policy) = &output.cache_policy {
-        println!("  cache policy: {policy:?}");
+
+        println!(
+            "\ndetecting virtual packages for {} [{platform}]:",
+            channel.canonical_name()
+        );
+
+        for (plugin, declared) in &registrations {
+            let declared: BTreeSet<_> = declared.iter().cloned().collect();
+            let detection = detect_virtual_packages(DetectOptions {
+                gateway: &gateway,
+                package_cache: &package_cache,
+                detection_cache: &detection_cache,
+                channel,
+                plugin,
+                declared: &declared,
+                environment_root: &environment_root,
+                host_platform: platform,
+                now,
+            })
+            .await;
+
+            match detection {
+                Ok(detection) => {
+                    let source = if detection.from_cache {
+                        "cached"
+                    } else {
+                        "ran"
+                    };
+                    if detection.virtual_packages.is_empty() {
+                        println!(
+                            "  {} ({source}): none of {} are present",
+                            plugin.as_source(),
+                            declared.iter().map(PackageName::as_source).join(", ")
+                        );
+                    }
+                    for detected in &detection.virtual_packages {
+                        println!("  {} ({source}): {}", plugin.as_source(), detected.package);
+                    }
+                }
+                Err(err) => println!("  {}: skipped, {err}", plugin.as_source()),
+            }
+        }
     }
 
     Ok(())

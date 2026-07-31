@@ -4,11 +4,13 @@
 
 ### Status
 
-Implemented behind the `experimental-virtual-package-plugins` cargo feature: the registration is
-parsed from repodata and handed to callers, and a plugin's output can be parsed and checked against
-that registration. What is missing is the machinery that produces the output -- installing a plugin,
-running it, caching what it said. Nothing is visible unless the feature is enabled, and rattler still
-fetches or executes no plugin today.
+Working end to end behind the `experimental-virtual-package-plugins` cargo feature: a channel's
+registration is read from repodata, the plugin it names is installed and run, its verdicts are checked
+against that registration and cached, and `rattler virtual-packages --detect` reports them. Nothing is
+visible unless the feature is enabled, and a default build can neither fetch nor execute a plugin.
+
+What is missing is what happens next: nothing feeds the results into a solve, and there is no trust model
+beyond the feature flag itself.
 
 | Part | State |
 | --- | --- |
@@ -19,7 +21,7 @@ fetches or executes no plugin today.
 | Plugin output protocol (JSON Lines) | Implemented |
 | Contract check of output against the registration | Implemented |
 | `ChannelVirtualPackage` result type | Implemented |
-| `rattler virtual-packages -c <channel> [--plugin/--check-output]` | Implemented |
+| `rattler virtual-packages -c <channel> [--detect]` | Implemented |
 | Conflict resolution across channels | Deliberately not done -- reported as declared, caller decides |
 | Running a plugin out of an existing environment | Implemented |
 | Detection result cache | Implemented |
@@ -437,10 +439,24 @@ drift apart.
 
 For manual inspection, `rattler virtual-packages -c <channel>` walks the `base` chain and prints every
 registration the channel can see, keyed by virtual package, warning where one shadows a name clients
-detect themselves or a name an inherited channel already registers. Adding `--plugin <name>
---check-output <path|->` instead parses recorded plugin output and checks it against that channel's
-registration -- scaffolding to exercise the protocol and the contract before an executor exists, and
-worth deleting once one does.
+detect themselves or a name an inherited channel already registers.
+
+Adding `--detect` instead runs each registered plugin and reports what it found, marking whether the
+answer was cached or freshly produced:
+
+```
+🔌 file:///.../virtual-package-plugins/ [linux-64]
+  ✔ foobar-detect (from cache)
+      __foobar=1.2.3
+      __foobar_arch=0=gen4
+  ✖ rocm-detect (skipped)
+      the channel registers the plugin 'rocm-detect' but provides no such package
+```
+
+A plugin that fails is reported and skipped rather than aborting the run: one broken plugin should not
+hide what the others found. `--detect` takes a single platform, since detection inspects the running
+machine. Unlike the listing mode it does not walk the `base` chain: only plugins the named channels
+register themselves are run.
 
 Local fixtures to point it at, since no channel publishes the field yet:
 
