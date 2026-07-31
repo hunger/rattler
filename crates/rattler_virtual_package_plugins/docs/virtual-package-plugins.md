@@ -23,7 +23,8 @@ fetches or executes no plugin today.
 | Conflict resolution across channels | Deliberately not done -- reported as declared, caller decides |
 | Running a plugin out of an existing environment | Implemented |
 | Detection result cache | Implemented |
-| Plugin environment creation | Not implemented |
+| Plugin environment creation | Implemented |
+| Detection end to end (orchestration) | Not implemented |
 | Solver injection, `CONDA_OVERRIDE_*`, lockfile representation | Not implemented |
 | Trust / opt-in model | Open, blocks execution |
 | prefix.dev upload validation | Not implemented (server side) |
@@ -37,7 +38,8 @@ fetches or executes no plugin today.
 | Registration accessors and query output | `rattler_repodata_gateway` | done |
 | Output protocol, contract check | `rattler_virtual_package_plugins` | done |
 | Running a plugin (`runner`) | `rattler_virtual_package_plugins` | done |
-| Environment creation, orchestrator | `rattler_virtual_package_plugins` | to do |
+| Environment creation (`environment`) | `rattler_virtual_package_plugins` | done |
+| Orchestration (`detect`) | `rattler_virtual_package_plugins` | to do |
 | Detection result cache | `rattler_cache` | done |
 
 `ChannelVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
@@ -258,6 +260,32 @@ a shell script that checks a few paths.
 
 ### Data Written to Disk
 
+#### The plugin environment
+
+An ordinary conda environment in a directory named after a hash of every package in it, under a root the
+caller chooses:
+
+```
+exec/plugins/72029f5d5cf06962118b1863f7873826e48566014d12d0c6cf7dd7160964cea1/
+├── .plugin-ready          <- sentinel: this prefix finished installing
+├── CACHEDIR.TAG
+├── bin/foobar-detect      <- the entry point that gets run
+├── Scripts/               <- the Windows equivalent
+└── conda-meta/
+```
+
+`.plugin-ready` is written last, and is what distinguishes a finished prefix from one left behind by an
+interrupted install. It is empty; only its existence means anything.
+
+The directory name is not the plugin archive's own hash. It covers every resolved package, because what a
+plugin reports depends on what it runs with: a dependency upgrade, a downgrade, a dropped dependency or a
+rebuild of the same version each have to produce a different environment rather than a stale one. The
+input is sorted, so solver ordering does not affect it.
+
+That has a consequence worth stating plainly: the hash is unknown until the solve has happened, so a cache
+hit skips the install and the plugin run, never the solve. Against cached repodata the solve is the cheap
+half.
+
 #### The detection cache
 
 One JSON file per (channel, plugin, plugin environment) under
@@ -452,3 +480,6 @@ repeating the same driver query.
 9. **Versioning semantics.** Virtual package versions should follow conda version ordering so that
    constraints like `__rocm >= 6.0, < 7` work as expected.
 10. **wheelnext.** Worth looking at closely -- they are solving essentially the same problem.
+11. **Concurrent detections.** Nothing serializes two processes preparing the same plugin
+    environment: the sentinel keeps a half-installed prefix from being *used*, not two installers
+    from interleaving. The package cache below it locks; the prefix itself does not.

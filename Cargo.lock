@@ -5591,9 +5591,17 @@ dependencies = [
 name = "rattler_virtual_package_plugins"
 version = "0.1.0"
 dependencies = [
+ "fs-err",
+ "hex",
  "insta",
+ "rattler",
+ "rattler_cache",
  "rattler_conda_types",
+ "rattler_digest",
+ "rattler_repodata_gateway",
  "rattler_shell",
+ "rattler_solve",
+ "rattler_virtual_packages",
  "serde",
  "serde_json",
  "tempfile",
