@@ -22,7 +22,8 @@ fetches or executes no plugin today.
 | `rattler virtual-packages -c <channel> [--plugin/--check-output]` | Implemented |
 | Conflict resolution across channels | Deliberately not done -- reported as declared, caller decides |
 | Running a plugin out of an existing environment | Implemented |
-| Plugin environment creation, result caching | Not implemented |
+| Detection result cache | Implemented |
+| Plugin environment creation | Not implemented |
 | Solver injection, `CONDA_OVERRIDE_*`, lockfile representation | Not implemented |
 | Trust / opt-in model | Open, blocks execution |
 | prefix.dev upload validation | Not implemented (server side) |
@@ -37,7 +38,7 @@ fetches or executes no plugin today.
 | Output protocol, contract check | `rattler_virtual_package_plugins` | done |
 | Running a plugin (`runner`) | `rattler_virtual_package_plugins` | done |
 | Environment creation, orchestrator | `rattler_virtual_package_plugins` | to do |
-| Detection result cache | `rattler_cache` | to do |
+| Detection result cache | `rattler_cache` | done |
 
 `ChannelVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
 because the result cache belongs in `rattler_cache`, beside `package_cache` and `run_exports_cache`,
@@ -254,6 +255,65 @@ the ordinary case and passes: every name still gets a verdict, they are simply a
 Plugins can be compiled binaries, shell scripts, or anything else that fits in a conda package.
 Keeping the interface this simple means detection for a new accelerator is a single small package with
 a shell script that checks a few paths.
+
+### Data Written to Disk
+
+#### The detection cache
+
+One JSON file per (channel, plugin, plugin environment) under
+`$RATTLER_CACHE_DIR/virtual-package-plugins/`. The file name is the plugin package name, so the
+directory is readable, followed by a SHA-256 over all three parts of the key:
+
+```
+virtual-package-plugins/foobar-detect-037701a2e23b3403ee56053f7e53566e91ee7ecd7043f1f5ffb8f11ca541839a.json
+```
+
+All three parts are needed. Two channels may ship a `cuda-detect` that reports different things, a
+channel may register several plugins, and what a plugin reports depends on the packages it runs with. The
+plugin name is validated as a path component before use, since it comes from channel metadata and a
+channel must not be able to place a file outside the cache directory.
+
+```json
+{
+  "virtual_packages": [
+    {
+      "channel": "file:///path/to/channels/virtual-package-plugins",
+      "plugin_sha256": "72029f5d5cf06962118b1863f7873826e48566014d12d0c6cf7dd7160964cea1",
+      "package": "__foobar=1.2.3"
+    },
+    {
+      "channel": "file:///path/to/channels/virtual-package-plugins",
+      "plugin_sha256": "72029f5d5cf06962118b1863f7873826e48566014d12d0c6cf7dd7160964cea1",
+      "package": "__foobar_arch=0=gen4"
+    }
+  ],
+  "expires_at": 1785501271,
+  "watched": [
+    { "path": "/sys/module/amdgpu/version", "modified_ms": 1785497600000 }
+  ]
+}
+```
+
+- **`virtual_packages`** -- the verdicts, each carrying provenance. `package` is the
+  `name=version=build_string` form, with the build string omitted when empty. `plugin_sha256` identifies
+  the plugin environment rather than the plugin archive.
+- **`expires_at`** -- seconds since the Unix epoch, derived from the `ttl_seconds` the plugin asked for.
+  `null` means no time limit, so only `watched` can invalidate the entry.
+- **`watched`** -- one entry per path the plugin asked to have watched, recording its modification time in
+  milliseconds since the epoch, or `null` if it did not exist. Either changing invalidates the entry, so a
+  driver appearing counts as much as one being upgraded -- the case a TTL cannot catch.
+
+An entry is a miss if it is absent, expired, has a changed watched path, **or fails to parse**. A corrupt
+cache file costs one plugin run; failing a solve over it would be worse.
+
+A changed *registration* does not invalidate an entry: the key covers the channel, the plugin and its
+environment, but not the set of virtual packages the channel registered the plugin for. A channel that
+narrows its registration while the plugin environment stays identical is therefore served the old
+verdicts, unchecked against the new registration, until the TTL or a watched path catches up.
+
+The cache stores facts rather than protocol types: the caller turns a plugin's declared policy into an
+expiry and a set of watched paths. That is also what lets the cache live in `rattler_cache` without it
+depending on the crate that produces those results.
 
 ### Gateway Integration
 
