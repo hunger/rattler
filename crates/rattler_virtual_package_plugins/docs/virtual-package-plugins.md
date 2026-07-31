@@ -24,7 +24,7 @@ fetches or executes no plugin today.
 | Running a plugin out of an existing environment | Implemented |
 | Detection result cache | Implemented |
 | Plugin environment creation | Implemented |
-| Detection end to end (orchestration) | Not implemented |
+| Detection end to end (orchestration) | Implemented |
 | Solver injection, `CONDA_OVERRIDE_*`, lockfile representation | Not implemented |
 | Trust / opt-in model | Open, blocks execution |
 | prefix.dev upload validation | Not implemented (server side) |
@@ -39,7 +39,7 @@ fetches or executes no plugin today.
 | Output protocol, contract check | `rattler_virtual_package_plugins` | done |
 | Running a plugin (`runner`) | `rattler_virtual_package_plugins` | done |
 | Environment creation (`environment`) | `rattler_virtual_package_plugins` | done |
-| Orchestration (`detect`) | `rattler_virtual_package_plugins` | to do |
+| Orchestration (`detect`) | `rattler_virtual_package_plugins` | done |
 | Detection result cache | `rattler_cache` | done |
 
 `ChannelVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
@@ -129,8 +129,7 @@ publishing a malformed name does not make the whole `repodata.json` unusable.
 
 ### 2. Client-Side: Plugin Execution and Caching
 
-*The output protocol and the contract check are implemented; fetching, installing, running and
-caching are not. The decisions below are settled and constrain what remains.*
+*Implemented by `detect::detect_virtual_packages`, which composes the steps below.*
 
 When a client resolves an environment and encounters a virtual package provided by a registered
 plugin, it:
@@ -233,8 +232,11 @@ The contract:
 - **stdout**: JSON Lines as above
 - **stderr**: diagnostic output, logged at debug level
 - **exit 0**: the plugin ran and its output is authoritative
-- **exit non-zero**: plugin failure; a warning is logged and every virtual package it was registered
-  for is treated as absent
+- **exit non-zero**: plugin failure, reported as a distinct error rather than an empty result. Every
+  detection failure means the same thing for a solve -- none of this plugin's virtual packages can be
+  used -- but they are kept apart so a caller can tell a broken plugin from a broken channel. Downgrading
+  that to "treat them as absent" is the caller's decision, since a system without the hardware looks the
+  same from here
 
 This replaces the draft's three-way exit code (`0` present / `1` absent / `2+` failure). With several
 virtual packages per plugin, presence is per verdict and cannot be carried by one exit status:
@@ -339,9 +341,72 @@ environment, but not the set of virtual packages the channel registered the plug
 narrows its registration while the plugin environment stays identical is therefore served the old
 verdicts, unchecked against the new registration, until the TTL or a watched path catches up.
 
+An absent result is cached like any other. "None of these are present on this system" is a real answer and
+costs exactly as much to recompute.
+
 The cache stores facts rather than protocol types: the caller turns a plugin's declared policy into an
 expiry and a set of watched paths. That is also what lets the cache live in `rattler_cache` without it
 depending on the crate that produces those results.
+
+### Failure Modes
+
+Every way detection can fail, and what each means. They all mean the same thing for a solve -- none of
+this plugin's virtual packages can be used -- but they are kept distinct so a caller can say which
+happened, and tell a broken plugin from a broken channel.
+
+**Reading the registration**
+
+| Condition | Outcome |
+| --- | --- |
+| No `virtual_package_plugins` in `info`, or an empty map | Not a failure: the channel registers no plugins |
+| A malformed plugin or virtual package name | Not a failure: names are parsed unvalidated, so one bad entry cannot make a channel unusable |
+| A registered name that cannot be used as a package spec | Error, naming the offending registration |
+
+**Preparing the environment**
+
+| Condition | Outcome |
+| --- | --- |
+| The channel's repodata cannot be fetched | Error, wrapping the gateway's own |
+| This system's *built-in* virtual packages cannot be determined | Error. The plugin solve needs them, so a machine whose libc or CPU cannot be identified cannot run plugins either |
+| The channel registers the plugin but ships no such package | Error saying exactly that, checked before the solve rather than inferred from its failure |
+| The plugin's dependencies cannot be resolved | Error. This is also where a plugin depending on a *plugin-provided* virtual package lands, since the solve sees built-in ones only -- deliberately, as that is what stops the recursion |
+| The environment cannot be installed | Error, wrapping the installer's own |
+| The `.plugin-ready` sentinel cannot be written | Error. The prefix is left in place but is not treated as ready, so the next attempt reinstalls rather than running a half-installed plugin |
+
+**Running the plugin**
+
+| Condition | Outcome |
+| --- | --- |
+| No executable named after the plugin package in the prefix | Error naming what was looked for and where |
+| The executable exists but cannot be started | Error, wrapping the OS error |
+| Exit code other than `0`, or death by signal | Error carrying the code and the plugin's stderr. The plugin ran and said no; whether to downgrade that to "these virtual packages are absent" is the caller's decision, since a machine without the hardware looks the same from here |
+| Still running after one second | Error. The plugin is killed; a hanging plugin must not hang the solve with it |
+| More output than the registration can need | Error. The plugin is killed once it exceeds its budget, one line's worth per registered virtual package plus headroom (see the contract) |
+
+**Reading the output**
+
+| Condition | Outcome |
+| --- | --- |
+| A line that is not a valid protocol object | Error carrying the 1-based line number, so it can be found in a log |
+| An unknown line kind, or an unknown field | Error: both are rejected rather than ignored |
+| More than one `cache` line | Error naming the second one's line; which policy applied would otherwise be undefined |
+| No output at all | Not a failure, but the contract below then rejects it for saying nothing about names it was registered for |
+
+**Checking the contract**
+
+| Condition | Outcome |
+| --- | --- |
+| A virtual package the channel did not register | Error listing every offending name |
+| Silence about one the channel did register | Error listing every missing name |
+| The same virtual package reported twice | Error, reported ahead of the other two, since a duplicate makes them ambiguous |
+
+**Caching the result**
+
+| Condition | Outcome |
+| --- | --- |
+| The key cannot be used as a path component | Error. The plugin name comes from channel metadata, so this is the check that stops a channel writing outside the cache directory |
+| The cache cannot be read or written | Error |
+| An entry exists but does not parse | Not a failure: treated as a miss. The cost is one plugin run, where failing a solve over a corrupt cache file would be worse |
 
 ### Gateway Integration
 

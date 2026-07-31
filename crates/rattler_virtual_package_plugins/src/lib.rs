@@ -6,21 +6,25 @@
 //!
 //! A channel registers a plugin package and the virtual packages it speaks for.
 //! Detecting them means installing that plugin into an environment of its own,
-//! running it, and reading its verdicts back. This crate currently implements
-//! the parts that need no I/O:
+//! running it, and reading its verdicts back:
 //!
-//! - [`protocol`] parses what a plugin writes to stdout.
-//! - [`contract`] checks those verdicts against what the channel registered.
 //! - [`environment`] installs a plugin into an environment of its own.
 //! - [`runner`] runs a plugin out of that environment.
+//! - [`protocol`] parses what a plugin writes to stdout.
+//! - [`contract`] checks those verdicts against what the channel registered.
+//! - [`detect`] composes all of those with a cache and returns
+//!   [`ChannelVirtualPackage`](rattler_conda_types::ChannelVirtualPackage)s.
 //!
-//! What is still missing is the orchestration that ties these together with a
-//! cache and returns [`ChannelVirtualPackage`](rattler_conda_types::ChannelVirtualPackage)s.
+//! [`detect::detect_virtual_packages`] is the entry point. The rest is public
+//! because it is useful on its own to a caller that wants to do part of this
+//! itself.
 
 #![deny(missing_docs)]
 
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod contract;
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod detect;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod environment;
 #[cfg(feature = "experimental-virtual-package-plugins")]
@@ -30,6 +34,8 @@ pub mod runner;
 
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use contract::{ContractViolation, validate};
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use detect::{DetectError, DetectOptions, Detection, detect_virtual_packages};
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use environment::{
     EnvironmentError, PluginEnvironment, PluginEnvironmentOptions, ensure_plugin_environment,

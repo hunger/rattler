@@ -13,6 +13,7 @@ experimental-virtual-package-plugins = [
   "dep:hex",
   "dep:rattler",
   "dep:rattler_cache",
+  "rattler_cache/experimental-virtual-package-plugins",
   "dep:rattler_digest",
   "dep:rattler_repodata_gateway",
   "rattler_repodata_gateway/experimental-virtual-package-plugins",
