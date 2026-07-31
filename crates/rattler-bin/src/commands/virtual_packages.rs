@@ -31,6 +31,16 @@ pub struct Opt {
     #[cfg(feature = "experimental-virtual-package-plugins")]
     #[clap(short, long)]
     platforms: Vec<Platform>,
+
+    /// Check a plugin's recorded output against what a channel registered it for
+    #[cfg(feature = "experimental-virtual-package-plugins")]
+    #[clap(long, requires = "plugin", value_name = "PATH_OR_DASH")]
+    check_output: Option<String>,
+
+    /// Plugin package whose output --check-output holds
+    #[cfg(feature = "experimental-virtual-package-plugins")]
+    #[clap(long, requires = "check_output")]
+    plugin: Option<String>,
 }
 
 pub async fn virtual_packages(opt: Opt, offline: bool) -> miette::Result<()> {
@@ -42,12 +52,36 @@ pub async fn virtual_packages(opt: Opt, offline: bool) -> miette::Result<()> {
     }
 
     #[cfg(feature = "experimental-virtual-package-plugins")]
-    print_plugins(&opt.channels, &opt.platforms, offline).await?;
+    if let (Some(output), Some(plugin)) = (&opt.check_output, &opt.plugin) {
+        check_plugin_output(&opt.channels, &opt.platforms, offline, plugin, output).await?;
+    } else {
+        print_plugins(&opt.channels, &opt.platforms, offline).await?;
+    }
 
     #[cfg(not(feature = "experimental-virtual-package-plugins"))]
     let _ = (opt, offline);
 
     Ok(())
+}
+
+/// A gateway configured for reading plugin registrations: no sharded repodata
+/// preference, and the caller's offline setting respected.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+fn plugin_gateway(offline: bool) -> miette::Result<Gateway> {
+    use std::collections::HashMap;
+
+    use rattler_repodata_gateway::SourceConfig;
+
+    Ok(Gateway::builder()
+        .with_client(super::client::create_client_with_middleware(offline)?)
+        .with_channel_config(rattler_repodata_gateway::ChannelConfig {
+            default: SourceConfig {
+                cache_action: super::client::repodata_cache_action(offline),
+                ..SourceConfig::default()
+            },
+            per_channel: HashMap::new(),
+        })
+        .finish())
 }
 
 /// Prints the plugin registrations declared by each `(channel, platform)`
@@ -58,9 +92,7 @@ async fn print_plugins(
     platforms: &[Platform],
     offline: bool,
 ) -> miette::Result<()> {
-    use std::{collections::HashMap, env};
-
-    use rattler_repodata_gateway::SourceConfig;
+    use std::env;
 
     if channels.is_empty() {
         return Ok(());
@@ -80,16 +112,7 @@ async fn print_plugins(
         platforms.to_vec()
     };
 
-    let gateway = Gateway::builder()
-        .with_client(super::client::create_client_with_middleware(offline)?)
-        .with_channel_config(rattler_repodata_gateway::ChannelConfig {
-            default: SourceConfig {
-                cache_action: super::client::repodata_cache_action(offline),
-                ..SourceConfig::default()
-            },
-            per_channel: HashMap::new(),
-        })
-        .finish();
+    let gateway = plugin_gateway(offline)?;
 
     for channel in &channels {
         for platform in &platforms {
@@ -347,4 +370,82 @@ mod tests {
             warnings[0]
         );
     }
+}
+
+/// Parses recorded plugin output and checks it against the virtual packages the
+/// channel registered that plugin for, without installing or running anything.
+///
+/// This is how the protocol and contract can be exercised against real channel
+/// metadata before there is an executor to produce the output for real.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+async fn check_plugin_output(
+    channels: &[String],
+    platforms: &[Platform],
+    offline: bool,
+    plugin: &str,
+    output_path: &str,
+) -> miette::Result<()> {
+    use std::collections::BTreeSet;
+
+    use miette::{Context, bail};
+    use rattler_virtual_package_plugins::{parse_output, validate};
+
+    let [channel] = channels else {
+        bail!("--check-output needs exactly one -c/--channel");
+    };
+    let [platform] = platforms else {
+        bail!("--check-output needs exactly one -p/--platforms");
+    };
+
+    let stdout = if output_path == "-" {
+        std::io::read_to_string(std::io::stdin())
+            .into_diagnostic()
+            .context("failed to read plugin output from stdin")?
+    } else {
+        std::fs::read_to_string(output_path)
+            .into_diagnostic()
+            .with_context(|| format!("failed to read plugin output from '{output_path}'"))?
+    };
+
+    let channel_config =
+        ChannelConfig::default_with_root_dir(std::env::current_dir().into_diagnostic()?);
+    let channel = Channel::from_str(channel, &channel_config).into_diagnostic()?;
+    let gateway = plugin_gateway(offline)?;
+
+    let plugin = PackageName::try_from(plugin).into_diagnostic()?;
+    let registrations = gateway
+        .virtual_package_plugins(&channel, *platform)
+        .await
+        .into_diagnostic()?;
+    let Some(declared) = registrations.get(&plugin) else {
+        bail!(
+            "{} does not register a plugin named '{}' for {platform}",
+            channel.canonical_name(),
+            plugin.as_source()
+        );
+    };
+    let declared: BTreeSet<_> = declared.iter().cloned().collect();
+
+    println!(
+        "\nchecking '{}' against {} [{platform}], registered for {}",
+        plugin.as_source(),
+        channel.canonical_name(),
+        declared.iter().map(PackageName::as_source).join(", ")
+    );
+
+    let output = parse_output(&stdout).into_diagnostic()?;
+    validate(&declared, &output).into_diagnostic()?;
+
+    println!("  contract satisfied; detected:");
+    for verdict in &output.detections {
+        match verdict.to_generic() {
+            Some(package) => println!("    {package}"),
+            None => println!("    {} absent", verdict.name.as_source()),
+        }
+    }
+    if let Some(policy) = &output.cache_policy {
+        println!("  cache policy: {policy:?}");
+    }
+
+    Ok(())
 }

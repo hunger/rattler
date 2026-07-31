@@ -37,6 +37,8 @@ oauth = ["rattler/oauth"]
 experimental-virtual-package-plugins = [
   "rattler_repodata_gateway/experimental-virtual-package-plugins",
   "rattler_index/experimental-virtual-package-plugins",
+  "dep:rattler_virtual_package_plugins",
+  "rattler_virtual_package_plugins/experimental-virtual-package-plugins",
 ]
 
 [dependencies]
@@ -66,6 +68,7 @@ rattler_solve = { workspace = true, default-features = false, features = [
   "resolvo",
   "libsolv_c",
 ] }
+rattler_virtual_package_plugins = { workspace = true, optional = true }
 rattler_virtual_packages = { workspace = true, default-features = false }
 rattler_cache = { workspace = true, default-features = false }
 rattler_menuinst = { workspace = true, default-features = false }
