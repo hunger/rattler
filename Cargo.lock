@@ -5585,6 +5585,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rattler_virtual_package_plugins"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "rattler_conda_types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "rattler_virtual_packages"
 version = "4.1.0"
 dependencies = [

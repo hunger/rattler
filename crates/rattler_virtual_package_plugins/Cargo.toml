@@ -1,0 +1,21 @@
+[package]
+description = "Detect virtual packages using channel-provided detection plugins"
+edition.workspace = true
+license.workspace = true
+name = "rattler_virtual_package_plugins"
+repository.workspace = true
+version = "0.1.0"
+
+[features]
+experimental-virtual-package-plugins = [
+  "rattler_conda_types/experimental-virtual-package-plugins",
+]
+
+[dependencies]
+rattler_conda_types = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
