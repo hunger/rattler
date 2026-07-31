@@ -11,8 +11,9 @@
 //!
 //! - [`protocol`] parses what a plugin writes to stdout.
 //! - [`contract`] checks those verdicts against what the channel registered.
+//! - [`runner`] runs a plugin out of an environment that already exists.
 //!
-//! Nothing here fetches, installs or executes anything yet.
+//! Nothing here fetches or installs a plugin yet.
 
 #![deny(missing_docs)]
 
@@ -20,6 +21,8 @@
 pub mod contract;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod protocol;
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod runner;
 
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use contract::{ContractViolation, validate};
@@ -27,3 +30,5 @@ pub use contract::{ContractViolation, validate};
 pub use protocol::{
     CachePolicy, Detected, PluginLine, PluginOutput, ProtocolError, Verdict, parse_output,
 };
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use runner::{PluginRun, RunnerError, run_plugin};

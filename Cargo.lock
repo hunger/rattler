@@ -5591,9 +5591,13 @@ version = "0.1.0"
 dependencies = [
  "insta",
  "rattler_conda_types",
+ "rattler_shell",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

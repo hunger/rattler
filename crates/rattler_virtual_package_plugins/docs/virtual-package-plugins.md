@@ -21,7 +21,8 @@ fetches or executes no plugin today.
 | `ChannelVirtualPackage` result type | Implemented |
 | `rattler virtual-packages -c <channel> [--plugin/--check-output]` | Implemented |
 | Conflict resolution across channels | Deliberately not done -- reported as declared, caller decides |
-| Plugin environment creation, execution, result caching | Not implemented |
+| Running a plugin out of an existing environment | Implemented |
+| Plugin environment creation, result caching | Not implemented |
 | Solver injection, `CONDA_OVERRIDE_*`, lockfile representation | Not implemented |
 | Trust / opt-in model | Open, blocks execution |
 | prefix.dev upload validation | Not implemented (server side) |
@@ -34,7 +35,8 @@ fetches or executes no plugin today.
 | `ChannelVirtualPackage` | `rattler_conda_types` | done |
 | Registration accessors and query output | `rattler_repodata_gateway` | done |
 | Output protocol, contract check | `rattler_virtual_package_plugins` | done |
-| Environment creation, runner, orchestrator | `rattler_virtual_package_plugins` | to do |
+| Running a plugin (`runner`) | `rattler_virtual_package_plugins` | done |
+| Environment creation, orchestrator | `rattler_virtual_package_plugins` | to do |
 | Detection result cache | `rattler_cache` | to do |
 
 `ChannelVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
@@ -204,6 +206,24 @@ format instead of in a deserializer subtlety. `build_string` is optional and exi
 At most one `cache` line per run; a second one is an error, since which policy applies would be
 undefined. Unknown line kinds and unknown fields are rejected.
 
+#### The process boundary
+
+The entry point is invoked **directly, not through a shell**. A shell would run the environment's
+`activate.d` scripts, and anything those print lands on the same stdout the protocol is parsed from, so a
+chatty activation script would corrupt a plugin's output. What that gives up is limited: conda packages
+resolve their own libraries through `RPATH`, so only a plugin relying on `activate.d` side effects would
+notice.
+
+The plugin therefore sees:
+
+- **stdin** connected to `/dev/null`
+- the parent's environment, with the plugin environment's binary directories prepended to `PATH` and
+  `CONDA_PREFIX` set to the prefix
+- nothing else -- no arguments, no configuration file, no environment variable of its own
+
+Entry-point lookup uses the same directories activation would put on `PATH`
+(`rattler_shell::activation::prefix_path_entries`), and on Windows also tries `.exe`, `.bat` and `.cmd`.
+
 The contract:
 
 - **stdin**: empty
@@ -216,6 +236,16 @@ The contract:
 This replaces the draft's three-way exit code (`0` present / `1` absent / `2+` failure). With several
 virtual packages per plugin, presence is per verdict and cannot be carried by one exit status:
 `__cuda` may be present while `__cuda_arch` is not.
+
+**The run is bounded.** A plugin still running after **one second** is killed and reported as an
+error: it is meant to read a version file or query a driver, and one that needs longer would stall
+every solve that runs it. So is a plugin that produces more output than its registration can need:
+**8 KiB per registered virtual package, plus two lines of headroom** -- one for the cache policy, one
+of slack -- counted across stdout and stderr together. The 8 KiB per line is not tight. A verdict
+line cannot get long, since a package's name, version and build string together fit in an archive
+file name, which caps them at under 250 bytes; what can get long is a `cache` line watching a
+filesystem path, at most `PATH_MAX` (4096 bytes on Linux), and 8 KiB fits one maximal path with
+every byte JSON-escaped.
 
 **Validation is exact.** Every registered name gets exactly one verdict; a duplicate, a name that was
 never registered, or silence about one that was, each fail the run. A machine without the hardware is
