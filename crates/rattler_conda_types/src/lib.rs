@@ -21,6 +21,8 @@ pub mod utils;
 mod version;
 pub mod version_spec;
 
+#[cfg(feature = "experimental-virtual-package-plugins")]
+mod channel_virtual_package;
 pub mod compression_level;
 mod environment_yaml;
 mod generic_virtual_package;
@@ -38,6 +40,8 @@ use std::path::{Path, PathBuf};
 pub use build_spec::{BuildNumber, BuildNumberSpec, OrdOperator, ParseBuildNumberSpecError};
 pub use channel::{Channel, ChannelConfig, ChannelUrl, NamedChannelOrUrl, ParseChannelError};
 pub use channel_data::{ChannelData, ChannelDataPackage};
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use channel_virtual_package::ChannelVirtualPackage;
 pub use environment_yaml::{EnvironmentYaml, MatchSpecOrSubSection};
 pub use explicit_environment_spec::{
     ExplicitEnvironmentEntry, ExplicitEnvironmentSpec, PackageArchiveHash,
