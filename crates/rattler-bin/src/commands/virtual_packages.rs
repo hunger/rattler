@@ -325,7 +325,8 @@ async fn detect_plugins(
     };
     use rattler_repodata_gateway::SubdirVirtualPackagePlugins;
     use rattler_virtual_package_plugins::{
-        DetectOptions, PluginContext, detect_virtual_packages, resolve_views,
+        BuiltinVirtualPackages, DetectOptions, PluginContext, VirtualPackageFactory,
+        detect_virtual_packages, resolve_views,
     };
 
     if channels.is_empty() {
@@ -410,6 +411,15 @@ async fn detect_plugins(
         now,
     };
 
+    // The client's own virtual packages are in every view, per CEP 30. Resolved
+    // once: they do not vary by channel, and detecting them can mean a driver
+    // query.
+    let builtins = BuiltinVirtualPackages::from_env();
+    let built_in = builtins
+        .resolve()
+        .await
+        .map_err(|err| miette::miette!(err))?;
+
     for view in &resolved_views {
         if view.plugins.is_empty() && view.shadowed.is_empty() {
             continue;
@@ -421,6 +431,25 @@ async fn detect_plugins(
             console::style(&view.channel).bold(),
             console::style(format!("[{platform}]")).dim(),
         );
+
+        // A plugin in this view claiming a name the client also detects
+        // overrides it, so the built-in is only shown where nothing did.
+        let overridden: std::collections::BTreeSet<_> = view
+            .plugins
+            .iter()
+            .flat_map(|resolved| resolved.provides.iter().cloned())
+            .collect();
+        for detected in &built_in {
+            if overridden.contains(&detected.package.name) {
+                continue;
+            }
+            println!(
+                "  {} {} {}",
+                console::style(console::Emoji("•", "-")).dim(),
+                console::style(&detected.package).dim(),
+                console::style("(built in)").dim(),
+            );
+        }
 
         for resolved in view.plugins.iter().chain(&view.shadowed) {
             if resolved.provides.is_empty() {

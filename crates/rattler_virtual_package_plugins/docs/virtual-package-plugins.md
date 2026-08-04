@@ -667,12 +667,21 @@ answer was cached or freshly produced:
 
 ```
 🔌 file:///.../virtual-package-plugins/ [linux-64]
+  • __unix=0=0 (built in)
+  • __linux=7.0.11=0 (built in)
+  • __glibc=2.43=0 (built in)
+  • __archspec=1=zen5 (built in)
   ✔ foobar-detect (from cache)
       __foobar=1.2.3
       __foobar_arch=0=gen4
   ✖ rocm-detect (skipped)
       the channel registers the plugin 'rocm-detect' but provides no such package
 ```
+
+Each view reports its whole set, built-ins included, because that is what a view *is* -- the virtual
+packages a solve against that channel would see. The built-ins come from `BuiltinVirtualPackages`,
+resolved once for the run since they do not vary by channel and detecting them can mean a driver
+query. A built-in whose name a plugin in that view claims is not printed: the plugin overrode it.
 
 A plugin that fails is reported and skipped rather than aborting the run: one broken plugin should not
 hide what the others found. Where a plugin fails after starting, its own stderr is printed beneath the
