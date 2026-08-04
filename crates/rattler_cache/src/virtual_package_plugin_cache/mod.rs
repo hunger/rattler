@@ -6,7 +6,7 @@
 //! those apply to it, and this module stores enough to check both.
 //!
 //! The cache deliberately knows nothing about the plugin protocol: the caller
-//! turns a plugin's declared policy into an expiry and a set of watched paths,
+//! turns a plugin's declared policy into an expiry and a set of things to watch,
 //! and what is stored here is those facts.
 
 mod cache_key;
@@ -58,6 +58,74 @@ fn modified_ms(path: &Path) -> Option<i64> {
     i64::try_from(since_epoch.as_millis()).ok()
 }
 
+/// The value of a watched environment variable when the verdicts were recorded.
+///
+/// Being set at all is part of it, the same way a watched path's existence is:
+/// `CUDA_VISIBLE_DEVICES` appearing hides hardware that was visible when the
+/// plugin last looked, and unsetting it brings the hardware back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchedEnv {
+    /// The variable that was watched.
+    pub name: String,
+
+    /// What it held, or `None` if it was not set.
+    pub value: Option<String>,
+}
+
+impl WatchedEnv {
+    /// Records the current value of `name`.
+    pub fn record(name: impl Into<String>) -> Self {
+        Self::record_from(name, environment_value)
+    }
+
+    /// Whether the variable still holds what it did when it was recorded.
+    pub fn is_unchanged(&self) -> bool {
+        self.is_unchanged_from(environment_value)
+    }
+
+    /// [`WatchedEnv::record`] against something other than the process
+    /// environment.
+    ///
+    /// Setting a variable to test the real thing would mean mutating state every
+    /// other thread in the process shares, which is exactly the kind of race
+    /// that makes an unrelated test fail once a week.
+    fn record_from(name: impl Into<String>, lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let name = name.into();
+        Self {
+            value: lookup(&name),
+            name,
+        }
+    }
+
+    /// [`WatchedEnv::is_unchanged`] against something other than the process
+    /// environment.
+    fn is_unchanged_from(&self, lookup: impl Fn(&str) -> Option<String>) -> bool {
+        lookup(&self.name) == self.value
+    }
+}
+
+/// What the process environment holds for `name`, or `None` if it is unset.
+fn environment_value(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// What a plugin asked to have watched on its behalf.
+///
+/// Grouped rather than passed as two lists so that adding a third kind of watch
+/// does not change every caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchList {
+    /// Paths whose existence or modification time matters.
+    pub paths: Vec<PathBuf>,
+
+    /// Environment variables whose value or absence matters. These are read
+    /// from the process that runs the plugin, not from the plugin's activated
+    /// environment: the activated one is already covered by the environment
+    /// hash the entry is keyed on, while this one is what a user changes
+    /// between two solves.
+    pub env: Vec<String>,
+}
+
 /// Verdicts from one plugin run, with what makes them stale.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedDetection {
@@ -71,18 +139,23 @@ pub struct CachedDetection {
     /// Paths the plugin asked to have watched, as they were at record time.
     #[serde(default)]
     pub watched: Vec<WatchedPath>,
+
+    /// Environment variables the plugin asked to have watched, as they were at
+    /// record time.
+    #[serde(default)]
+    pub watched_env: Vec<WatchedEnv>,
 }
 
 impl CachedDetection {
-    /// Records verdicts that expire `ttl_seconds` after `now`, watching
-    /// `watch_paths` as they are right now.
+    /// Records verdicts that expire `ttl_seconds` after `now`, watching what
+    /// `watch` names as it is right now.
     ///
     /// `now` is a parameter rather than read from the clock so expiry is
     /// testable without waiting.
     pub fn record(
         virtual_packages: Vec<ChannelVirtualPackage>,
         ttl_seconds: Option<u64>,
-        watch_paths: impl IntoIterator<Item = PathBuf>,
+        watch: &WatchList,
         now: i64,
     ) -> Self {
         Self {
@@ -90,7 +163,13 @@ impl CachedDetection {
             expires_at: ttl_seconds
                 .and_then(|ttl| i64::try_from(ttl).ok())
                 .and_then(|ttl| now.checked_add(ttl)),
-            watched: watch_paths.into_iter().map(WatchedPath::record).collect(),
+            watched: watch
+                .paths
+                .iter()
+                .cloned()
+                .map(WatchedPath::record)
+                .collect(),
+            watched_env: watch.env.iter().map(WatchedEnv::record).collect(),
         }
     }
 
@@ -100,6 +179,7 @@ impl CachedDetection {
             return false;
         }
         self.watched.iter().all(WatchedPath::is_unchanged)
+            && self.watched_env.iter().all(WatchedEnv::is_unchanged)
     }
 }
 
@@ -176,6 +256,14 @@ mod tests {
         )
     }
 
+    /// A watch list covering one path and nothing else.
+    fn watching(path: &Path) -> WatchList {
+        WatchList {
+            paths: vec![path.to_path_buf()],
+            ..WatchList::default()
+        }
+    }
+
     fn detected() -> Vec<ChannelVirtualPackage> {
         vec![ChannelVirtualPackage {
             channel: url::Url::parse("https://prefix.dev/org/").unwrap().into(),
@@ -192,7 +280,7 @@ mod tests {
     fn round_trips_verdicts() {
         let dir = tempfile::tempdir().unwrap();
         let cache = VirtualPackagePluginCache::new(dir.path());
-        let recorded = CachedDetection::record(detected(), Some(60), [], 1_000);
+        let recorded = CachedDetection::record(detected(), Some(60), &WatchList::default(), 1_000);
 
         cache.put(&key(), &recorded).unwrap();
         assert_eq!(cache.get(&key(), 1_000).unwrap(), Some(recorded));
@@ -212,7 +300,7 @@ mod tests {
         cache
             .put(
                 &key(),
-                &CachedDetection::record(detected(), Some(60), [], 1_000),
+                &CachedDetection::record(detected(), Some(60), &WatchList::default(), 1_000),
             )
             .unwrap();
 
@@ -222,7 +310,7 @@ mod tests {
 
     #[test]
     fn without_a_ttl_an_entry_does_not_expire() {
-        let recorded = CachedDetection::record(detected(), None, [], 0);
+        let recorded = CachedDetection::record(detected(), None, &WatchList::default(), 0);
         assert!(recorded.is_valid(i64::MAX));
     }
 
@@ -234,7 +322,7 @@ mod tests {
         let watched = dir.path().join("version");
         fs_err::write(&watched, "6.1.2").unwrap();
 
-        let recorded = CachedDetection::record(detected(), None, [watched.clone()], 0);
+        let recorded = CachedDetection::record(detected(), None, &watching(&watched), 0);
         assert!(recorded.is_valid(0));
 
         // A different modification time is what the check keys on, so set one
@@ -250,7 +338,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let watched = dir.path().join("version");
 
-        let recorded_absent = CachedDetection::record(detected(), None, [watched.clone()], 0);
+        let recorded_absent = CachedDetection::record(detected(), None, &watching(&watched), 0);
         assert!(recorded_absent.is_valid(0));
         fs_err::write(&watched, "6.1.2").unwrap();
         assert!(
@@ -258,12 +346,62 @@ mod tests {
             "a driver appearing must invalidate"
         );
 
-        let recorded_present = CachedDetection::record(detected(), None, [watched.clone()], 0);
+        let recorded_present = CachedDetection::record(detected(), None, &watching(&watched), 0);
         assert!(recorded_present.is_valid(0));
         fs_err::remove_file(&watched).unwrap();
         assert!(
             !recorded_present.is_valid(0),
             "a driver being removed must invalidate"
+        );
+    }
+
+    /// A variable can hide hardware from a plugin without anything on disk
+    /// changing, which is the case neither a TTL nor a watched path catches.
+    ///
+    /// Against a lookup of its own rather than the real environment: setting a
+    /// variable would mutate state every other test in this binary shares.
+    #[test]
+    fn a_changed_watched_environment_variable_invalidates_the_entry() {
+        let unset = |_: &str| None;
+        let hidden = |_: &str| Some("0".to_string());
+        let shown = |_: &str| Some("1".to_string());
+
+        // Recorded while unset: it appearing has to invalidate.
+        let recorded_unset = WatchedEnv::record_from("CUDA_VISIBLE_DEVICES", unset);
+        assert!(recorded_unset.is_unchanged_from(unset));
+        assert!(
+            !recorded_unset.is_unchanged_from(hidden),
+            "a variable appearing must invalidate"
+        );
+
+        // Recorded while set: changing it, and unsetting it, both have to.
+        let recorded_set = WatchedEnv::record_from("CUDA_VISIBLE_DEVICES", hidden);
+        assert!(recorded_set.is_unchanged_from(hidden));
+        assert!(
+            !recorded_set.is_unchanged_from(shown),
+            "a changed variable must invalidate"
+        );
+        assert!(
+            !recorded_set.is_unchanged_from(unset),
+            "a variable being unset must invalidate"
+        );
+    }
+
+    /// A watched variable reaches the recorded entry, and an entry watching one
+    /// that has not changed stays usable.
+    #[test]
+    fn watched_variables_are_recorded_with_the_entry() {
+        let watch = WatchList {
+            env: vec!["PATH".to_string()],
+            ..WatchList::default()
+        };
+        let recorded = CachedDetection::record(detected(), None, &watch, 0);
+
+        assert_eq!(recorded.watched_env.len(), 1);
+        assert_eq!(recorded.watched_env[0].name, "PATH");
+        assert!(
+            recorded.is_valid(0),
+            "nothing has changed since it was recorded"
         );
     }
 

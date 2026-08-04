@@ -5593,6 +5593,7 @@ version = "0.1.0"
 dependencies = [
  "fs-err",
  "hex",
+ "indexmap 2.14.0",
  "insta",
  "rattler",
  "rattler_cache",
@@ -5608,6 +5609,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

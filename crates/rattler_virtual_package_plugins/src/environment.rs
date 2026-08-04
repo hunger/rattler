@@ -1,6 +1,9 @@
 //! Installing a detection plugin into an environment of its own.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use rattler::install::Installer;
 use rattler_cache::package_cache::PackageCache;
@@ -17,7 +20,7 @@ use rattler_virtual_packages::{VirtualPackage, VirtualPackageOverrides};
 const READY_SENTINEL: &str = ".plugin-ready";
 
 /// An environment a plugin can be run from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PluginEnvironment {
     /// The prefix the plugin is installed in.
     pub prefix: PathBuf,
@@ -26,6 +29,31 @@ pub struct PluginEnvironment {
     /// it, so a dependency update yields a different environment rather than a
     /// stale one.
     pub sha256: Sha256Hash,
+
+    /// How long preparing it took, stage by stage.
+    pub timings: EnvironmentTimings,
+}
+
+/// How long each stage of preparing a plugin environment took.
+///
+/// Getting a plugin ready costs a network round trip, a solve and an install,
+/// and which of those dominates decides what is worth optimising. Measuring
+/// beats guessing, so the numbers travel with the result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EnvironmentTimings {
+    /// Reading the channel's repodata, which is where a cold cache is paid for.
+    pub repodata: Duration,
+
+    /// Resolving the plugin and its dependencies.
+    pub solve: Duration,
+
+    /// Installing the environment. Zero when an existing prefix was reused,
+    /// which is the ordinary case after the first run.
+    pub install: Duration,
+
+    /// Whether the repodata had to be re-read because the plugin turned out to
+    /// have dependencies. Two round trips rather than one.
+    pub refetched_for_dependencies: bool,
 }
 
 /// A plugin environment could not be prepared.
@@ -113,6 +141,12 @@ pub struct PluginEnvironmentOptions<'a> {
 /// The identity of the environment is not known until the solve has happened,
 /// since it covers every resolved package. A hit therefore skips the install, not
 /// the solve -- which against cached repodata is the cheap half.
+///
+/// The channel's repodata is read **without** the dependency closure first. A
+/// detection plugin should be self-contained, and the common one is: a script
+/// with no dependencies at all. Fetching the closure to discover that costs a
+/// round trip the answer never needed, so it is only fetched when the plugin's
+/// own record turns out to name dependencies.
 pub async fn ensure_plugin_environment(
     options: PluginEnvironmentOptions<'_>,
 ) -> Result<PluginEnvironment, EnvironmentError> {
@@ -124,6 +158,7 @@ pub async fn ensure_plugin_environment(
         root,
         host_platform,
     } = options;
+    let mut timings = EnvironmentTimings::default();
 
     let spec = MatchSpec::from_str(plugin.as_source(), ParseMatchSpecOptions::default()).map_err(
         |source| EnvironmentError::InvalidPluginName {
@@ -132,57 +167,104 @@ pub async fn ensure_plugin_environment(
         },
     )?;
 
-    let repo_data = gateway
-        .query(
-            vec![channel.clone()],
-            [host_platform, Platform::NoArch],
-            vec![spec.clone()],
-        )
-        .recursive(true)
-        .execute()
-        .await?;
+    let started = Instant::now();
+    let mut repo_data = query_plugin(gateway, channel, host_platform, &spec, false).await?;
 
-    // A registration naming a package the channel does not have is a mistake in
-    // the channel, and saying so beats letting the solver report an unsatisfiable
-    // dependency on a name the user never asked for.
-    if !repo_data
-        .iter()
-        .flat_map(rattler_repodata_gateway::RepoData::iter)
-        .any(|record| record.package_record.name == *plugin)
-    {
-        return Err(EnvironmentError::PluginPackageMissing {
-            plugin: plugin.as_source().to_string(),
-            channel: channel.canonical_name(),
-        });
+    let has_dependencies = {
+        let mut candidates = plugin_records(&repo_data, plugin).peekable();
+
+        // A registration naming a package the channel does not have is a mistake
+        // in the channel, and saying so beats letting the solver report an
+        // unsatisfiable dependency on a name the user never asked for.
+        if candidates.peek().is_none() {
+            return Err(EnvironmentError::PluginPackageMissing {
+                plugin: plugin.as_source().to_string(),
+                channel: channel.canonical_name(),
+            });
+        }
+
+        candidates.any(|record| !record.package_record.depends.is_empty())
+    };
+
+    // Any candidate with dependencies means the solve needs records this query
+    // did not ask for. Which candidate the solver picks is not known yet, so the
+    // closure is fetched when *any* of them could need it.
+    if has_dependencies {
+        timings.refetched_for_dependencies = true;
+        repo_data = query_plugin(gateway, channel, host_platform, &spec, true).await?;
     }
+    timings.repodata = started.elapsed();
 
     let virtual_packages = VirtualPackage::detect(&VirtualPackageOverrides::from_env())?
         .into_iter()
         .map(Into::into)
         .collect();
 
+    let started = Instant::now();
     let solved = Solver.solve(SolverTask {
         specs: vec![spec],
         virtual_packages,
         ..SolverTask::from_iter(&repo_data)
     })?;
+    timings.solve = started.elapsed();
 
     let sha256 = environment_sha256(&solved.records);
     let prefix = root.join(hex::encode(sha256));
     let sentinel = prefix.join(READY_SENTINEL);
     if sentinel.is_file() {
         tracing::debug!("reusing plugin environment at {}", prefix.display());
-        return Ok(PluginEnvironment { prefix, sha256 });
+        return Ok(PluginEnvironment {
+            prefix,
+            sha256,
+            timings,
+        });
     }
 
+    let started = Instant::now();
     Installer::new()
         .with_target_platform(host_platform)
         .with_package_cache(package_cache.clone())
         .install(&prefix, solved.records)
         .await?;
     fs_err::write(&sentinel, [])?;
+    timings.install = started.elapsed();
 
-    Ok(PluginEnvironment { prefix, sha256 })
+    Ok(PluginEnvironment {
+        prefix,
+        sha256,
+        timings,
+    })
+}
+
+/// Reads what a channel has for one plugin, with or without the records its
+/// dependencies would need.
+async fn query_plugin(
+    gateway: &Gateway,
+    channel: &Channel,
+    host_platform: Platform,
+    spec: &MatchSpec,
+    recursive: bool,
+) -> Result<rattler_repodata_gateway::RepoDataQueryOutput, rattler_repodata_gateway::GatewayError> {
+    gateway
+        .query(
+            vec![channel.clone()],
+            [host_platform, Platform::NoArch],
+            vec![spec.clone()],
+        )
+        .recursive(recursive)
+        .execute()
+        .await
+}
+
+/// Every record a query returned for the plugin package itself.
+fn plugin_records<'a>(
+    repo_data: &'a rattler_repodata_gateway::RepoDataQueryOutput,
+    plugin: &'a PackageName,
+) -> impl Iterator<Item = &'a RepoDataRecord> {
+    repo_data
+        .iter()
+        .flat_map(rattler_repodata_gateway::RepoData::iter)
+        .filter(move |record| record.package_record.name == *plugin)
 }
 
 /// Identifies a set of resolved packages by their contents.

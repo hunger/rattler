@@ -9,9 +9,9 @@ use std::collections::BTreeSet;
 
 use rattler_conda_types::PackageName;
 
-use crate::protocol::PluginOutput;
+use crate::protocol::PluginReport;
 
-/// A plugin's output does not match what its channel registered it for.
+/// A plugin's report does not match what its channel registered it for.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ContractViolation {
     /// The plugin reported a virtual package it was not registered for.
@@ -25,8 +25,8 @@ pub enum ContractViolation {
     },
 
     /// The plugin gave no verdict for something it was registered for. Absence
-    /// is reported with an explicit null version, so silence is a bug in the
-    /// plugin rather than a system without that hardware.
+    /// is reported as an explicit null, so silence is a bug in the plugin rather
+    /// than a system without that hardware.
     #[error(
         "the plugin gave no verdict for {}, which its channel registered it for",
         format_names(missing)
@@ -34,13 +34,6 @@ pub enum ContractViolation {
     Missing {
         /// The names that were registered but not reported, sorted.
         missing: Vec<PackageName>,
-    },
-
-    /// The plugin reported the same virtual package more than once.
-    #[error("the plugin reported {} more than once", format_names(duplicated))]
-    Duplicated {
-        /// The names reported more than once, sorted.
-        duplicated: Vec<PackageName>,
     },
 }
 
@@ -52,34 +45,30 @@ fn format_names(names: &[PackageName]) -> String {
         .join(", ")
 }
 
-/// Check that a plugin gave exactly one verdict for every virtual package its
-/// channel registered it for, and none for anything else.
+/// Check that a plugin gave a verdict for every virtual package its channel
+/// registered it for, and none for anything else.
 ///
-/// Duplicates are reported first, since a duplicate makes the other two
-/// answers ambiguous.
+/// A verdict cannot be given twice: the report is keyed by name, so the wire
+/// format has no way to say the same thing about one virtual package twice.
 pub fn validate(
     declared: &BTreeSet<PackageName>,
-    output: &PluginOutput,
+    report: &PluginReport,
 ) -> Result<(), ContractViolation> {
-    let mut seen = BTreeSet::new();
-    let mut duplicated = BTreeSet::new();
-    for detection in &output.detections {
-        if !seen.insert(detection.name.clone()) {
-            duplicated.insert(detection.name.clone());
-        }
-    }
-    if !duplicated.is_empty() {
-        return Err(ContractViolation::Duplicated {
-            duplicated: duplicated.into_iter().collect(),
-        });
-    }
-
-    let undeclared: Vec<_> = seen.difference(declared).cloned().collect();
+    let undeclared: Vec<_> = report
+        .virtual_packages
+        .keys()
+        .filter(|name| !declared.contains(*name))
+        .cloned()
+        .collect();
     if !undeclared.is_empty() {
         return Err(ContractViolation::Undeclared { undeclared });
     }
 
-    let missing: Vec<_> = declared.difference(&seen).cloned().collect();
+    let missing: Vec<_> = declared
+        .iter()
+        .filter(|name| !report.virtual_packages.contains_key(*name))
+        .cloned()
+        .collect();
     if !missing.is_empty() {
         return Err(ContractViolation::Missing { missing });
     }
@@ -90,7 +79,7 @@ pub fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::parse_output;
+    use crate::protocol::parse_report;
 
     fn declared(names: &[&str]) -> BTreeSet<PackageName> {
         names
@@ -99,23 +88,30 @@ mod tests {
             .collect()
     }
 
-    fn output(lines: &[&str]) -> PluginOutput {
-        parse_output(&lines.join("\n")).expect("valid protocol")
-    }
-
-    fn present(name: &str) -> String {
-        format!(r#"{{"kind": "present", "name": "{name}", "version": "1"}}"#)
-    }
-
-    fn absent(name: &str) -> String {
-        format!(r#"{{"kind": "absent", "name": "{name}"}}"#)
+    /// A report giving each named virtual package a verdict: present at version
+    /// 1, or absent where the name is prefixed with `!`.
+    fn report(names: &[&str]) -> PluginReport {
+        let verdicts: Vec<_> = names
+            .iter()
+            .map(|name| match name.strip_prefix('!') {
+                Some(absent) => format!(r#""{absent}": null"#),
+                None => format!(r#""{name}": {{"version": "1"}}"#),
+            })
+            .collect();
+        parse_report(&format!(
+            r#"{{"virtual_packages": {{{}}}}}"#,
+            verdicts.join(", ")
+        ))
+        .expect("valid protocol")
     }
 
     #[test]
     fn exact_coverage_passes() {
-        let out = output(&[&present("__cuda"), &present("__cuda_arch")]);
         assert_eq!(
-            validate(&declared(&["__cuda", "__cuda_arch"]), &out),
+            validate(
+                &declared(&["__cuda", "__cuda_arch"]),
+                &report(&["__cuda", "__cuda_arch"])
+            ),
             Ok(())
         );
     }
@@ -124,18 +120,19 @@ mod tests {
     /// still gets a verdict, they are just all absent.
     #[test]
     fn all_absent_passes() {
-        let out = output(&[&absent("__cuda"), &absent("__cuda_arch")]);
         assert_eq!(
-            validate(&declared(&["__cuda", "__cuda_arch"]), &out),
+            validate(
+                &declared(&["__cuda", "__cuda_arch"]),
+                &report(&["!__cuda", "!__cuda_arch"])
+            ),
             Ok(())
         );
     }
 
     #[test]
     fn undeclared_name_is_rejected() {
-        let out = output(&[&present("__cuda"), &present("__rocm")]);
         assert_eq!(
-            validate(&declared(&["__cuda"]), &out),
+            validate(&declared(&["__cuda"]), &report(&["__cuda", "__rocm"])),
             Err(ContractViolation::Undeclared {
                 undeclared: vec![PackageName::new_unchecked("__rocm")]
             })
@@ -144,9 +141,8 @@ mod tests {
 
     #[test]
     fn silence_about_a_registered_name_is_rejected() {
-        let out = output(&[&present("__cuda")]);
         assert_eq!(
-            validate(&declared(&["__cuda", "__cuda_arch"]), &out),
+            validate(&declared(&["__cuda", "__cuda_arch"]), &report(&["__cuda"])),
             Err(ContractViolation::Missing {
                 missing: vec![PackageName::new_unchecked("__cuda_arch")]
             })
@@ -154,27 +150,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_verdict_is_rejected_before_anything_else() {
-        // Also undeclared, but the duplicate is what gets reported.
-        let out = output(&[&present("__rocm"), &absent("__rocm")]);
-        assert_eq!(
-            validate(&declared(&["__cuda"]), &out),
-            Err(ContractViolation::Duplicated {
-                duplicated: vec![PackageName::new_unchecked("__rocm")]
-            })
-        );
-    }
-
-    #[test]
     fn registering_nothing_permits_nothing() {
-        assert_eq!(validate(&declared(&[]), &output(&[])), Ok(()));
-        assert!(validate(&declared(&[]), &output(&[&present("__cuda")])).is_err());
+        assert_eq!(validate(&declared(&[]), &report(&[])), Ok(()));
+        assert!(validate(&declared(&[]), &report(&["__cuda"])).is_err());
     }
 
     #[test]
     fn violations_name_every_offender() {
-        let out = output(&[&present("__a"), &present("__b")]);
-        let err = validate(&declared(&["__c"]), &out).unwrap_err();
+        let err = validate(&declared(&["__c"]), &report(&["__a", "__b"])).unwrap_err();
         assert_eq!(
             err.to_string(),
             "the plugin reported __a, __b which its channel did not register it for"

@@ -9,9 +9,12 @@
 //! running it, and reading its verdicts back:
 //!
 //! - [`environment`] installs a plugin into an environment of its own.
+//! - [`activation`] works out what that environment looks like once activated.
 //! - [`runner`] runs a plugin out of that environment.
 //! - [`protocol`] parses what a plugin writes to stdout.
 //! - [`contract`] checks those verdicts against what the channel registered.
+//! - [`resolve`] decides which plugin speaks for a virtual package two channels
+//!   both claim.
 //! - [`detect`] composes all of those with a cache and returns
 //!   [`ChannelVirtualPackage`](rattler_conda_types::ChannelVirtualPackage)s.
 //!
@@ -22,6 +25,8 @@
 #![deny(missing_docs)]
 
 #[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod activation;
+#[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod contract;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod detect;
@@ -30,20 +35,26 @@ pub mod environment;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod protocol;
 #[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod resolve;
+#[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod runner;
 
 #[cfg(feature = "experimental-virtual-package-plugins")]
+pub use activation::{ActivationError, activated_environment};
+#[cfg(feature = "experimental-virtual-package-plugins")]
 pub use contract::{ContractViolation, validate};
 #[cfg(feature = "experimental-virtual-package-plugins")]
-pub use detect::{DetectError, DetectOptions, Detection, detect_virtual_packages};
+pub use detect::{
+    DetectError, DetectOptions, Detection, DetectionTimings, detect_virtual_packages,
+};
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use environment::{
-    EnvironmentError, PluginEnvironment, PluginEnvironmentOptions, ensure_plugin_environment,
-    environment_sha256,
+    EnvironmentError, EnvironmentTimings, PluginEnvironment, PluginEnvironmentOptions,
+    ensure_plugin_environment, environment_sha256,
 };
 #[cfg(feature = "experimental-virtual-package-plugins")]
-pub use protocol::{
-    CachePolicy, Detected, PluginLine, PluginOutput, ProtocolError, Verdict, parse_output,
-};
+pub use protocol::{CachePolicy, Detected, PluginReport, ProtocolError, parse_report};
 #[cfg(feature = "experimental-virtual-package-plugins")]
-pub use runner::{PluginRun, RunnerError, run_plugin};
+pub use resolve::{ConflictingClaim, ResolvedPlugin, resolve_plugins};
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use runner::{PluginRun, RunOptions, RunTimeout, RunnerError, run_plugin};

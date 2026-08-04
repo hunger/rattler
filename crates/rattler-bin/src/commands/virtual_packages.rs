@@ -37,6 +37,16 @@ pub struct Opt {
     #[cfg(feature = "experimental-virtual-package-plugins")]
     #[clap(long)]
     detect: bool,
+
+    /// Seconds a plugin may run before it is killed [default: 5, maximum: 60]
+    #[cfg(feature = "experimental-virtual-package-plugins")]
+    #[clap(long, requires = "detect")]
+    plugin_timeout: Option<u64>,
+
+    /// Report how long each stage of detection took
+    #[cfg(feature = "experimental-virtual-package-plugins")]
+    #[clap(long, requires = "detect")]
+    timings: bool,
 }
 
 pub async fn virtual_packages(opt: Opt, offline: bool) -> miette::Result<()> {
@@ -49,7 +59,15 @@ pub async fn virtual_packages(opt: Opt, offline: bool) -> miette::Result<()> {
 
     #[cfg(feature = "experimental-virtual-package-plugins")]
     if opt.detect {
-        detect_plugins(&opt.channels, &opt.platforms, offline).await?;
+        let timeout = opt.plugin_timeout.map_or_else(
+            rattler_virtual_package_plugins::RunTimeout::default,
+            |seconds| {
+                rattler_virtual_package_plugins::RunTimeout::new(std::time::Duration::from_secs(
+                    seconds,
+                ))
+            },
+        );
+        detect_plugins(&opt.channels, &opt.platforms, offline, timeout, opt.timings).await?;
     } else {
         print_plugins(&opt.channels, &opt.platforms, offline).await?;
     }
@@ -379,7 +397,11 @@ mod tests {
     }
 }
 
-/// Runs every plugin the given channels register and reports what each detected.
+/// Runs the plugins the given channels register and reports what each detected.
+///
+/// Where two channels claim one virtual package, the higher-priority channel
+/// wins and the other plugin is reported as shadowed rather than run. Channels
+/// are in the priority order they were given on the command line.
 ///
 /// A plugin that fails is reported and skipped rather than aborting the run: one
 /// broken plugin should not hide what the others found, and a system without the
@@ -389,14 +411,19 @@ async fn detect_plugins(
     channels: &[String],
     platforms: &[Platform],
     offline: bool,
+    timeout: rattler_virtual_package_plugins::RunTimeout,
+    show_timings: bool,
 ) -> miette::Result<()> {
-    use std::{collections::BTreeSet, env};
+    use std::env;
 
     use rattler_cache::{
         default_cache_dir, package_cache::PackageCache,
         virtual_package_plugin_cache::VirtualPackagePluginCache,
     };
-    use rattler_virtual_package_plugins::{DetectOptions, detect_virtual_packages};
+    use rattler_repodata_gateway::SubdirVirtualPackagePlugins;
+    use rattler_virtual_package_plugins::{
+        DetectOptions, detect_virtual_packages, resolve_plugins,
+    };
 
     if channels.is_empty() {
         return Ok(());
@@ -430,80 +457,180 @@ async fn detect_plugins(
     // One timestamp for the whole run, so every plugin agrees on what now is.
     let now = jiff::Timestamp::now().as_second();
 
+    // Collected across every channel before anything runs: which plugin speaks
+    // for a virtual package cannot be decided one channel at a time.
+    let mut registrations = Vec::new();
     for channel in &channels {
-        let registrations = gateway
+        let plugins = gateway
             .virtual_package_plugins(channel, platform)
             .await
             .into_diagnostic()?;
-        if registrations.is_empty() {
+        if !plugins.is_empty() {
+            registrations.push(SubdirVirtualPackagePlugins {
+                channel: channel.base_url.clone(),
+                platform,
+                plugins,
+            });
+        }
+    }
+    let resolution = resolve_plugins(registrations).map_err(|err| miette::miette!(err))?;
+
+    let mut current_channel = None;
+    for resolved in resolution.plugins.iter().chain(&resolution.shadowed) {
+        if current_channel != Some(&resolved.channel) {
+            current_channel = Some(&resolved.channel);
+            println!(
+                "\n{}{} {}",
+                console::Emoji("🔌 ", ""),
+                console::style(&resolved.channel).bold(),
+                console::style(format!("[{platform}]")).dim(),
+            );
+        }
+
+        if resolved.provides.is_empty() {
+            report_shadowed(resolved);
             continue;
         }
 
-        println!(
-            "\n{}{} {}",
-            console::Emoji("🔌 ", ""),
-            console::style(channel.canonical_name()).bold(),
-            console::style(format!("[{platform}]")).dim(),
-        );
+        let channel = channels
+            .iter()
+            .find(|channel| channel.base_url == resolved.channel)
+            .expect("every resolved plugin came from one of these channels");
+        let detection = detect_virtual_packages(DetectOptions {
+            gateway: &gateway,
+            package_cache: &package_cache,
+            detection_cache: &detection_cache,
+            channel,
+            plugin: &resolved.plugin,
+            declared: &resolved.declared,
+            environment_root: &environment_root,
+            host_platform: platform,
+            timeout,
+            now,
+        })
+        .await;
 
-        for (plugin, declared) in &registrations {
-            let declared: BTreeSet<_> = declared.iter().cloned().collect();
-            let detection = detect_virtual_packages(DetectOptions {
-                gateway: &gateway,
-                package_cache: &package_cache,
-                detection_cache: &detection_cache,
-                channel,
-                plugin,
-                declared: &declared,
-                environment_root: &environment_root,
-                host_platform: platform,
-                now,
-            })
-            .await;
-
-            match detection {
-                Ok(detection) => {
-                    let source = if detection.from_cache {
-                        "from cache"
-                    } else {
-                        "ran the plugin"
-                    };
-                    println!(
-                        "  {} {} {}",
-                        console::style(console::Emoji("✔", "+")).green(),
-                        console::style(plugin.as_source()).bold(),
-                        console::style(format!("({source})")).dim(),
-                    );
-                    if detection.virtual_packages.is_empty() {
-                        println!(
-                            "      {}",
-                            console::style(format!(
-                                "none of {} are present on this system",
-                                declared.iter().map(PackageName::as_source).join(", ")
-                            ))
-                            .dim(),
-                        );
-                    }
-                    for detected in &detection.virtual_packages {
-                        println!("      {}", console::style(&detected.package).green());
-                    }
+        match detection {
+            Ok(detection) => report_detection(resolved, &detection, show_timings),
+            Err(err) => {
+                println!(
+                    "  {} {} {}",
+                    console::style(console::Emoji("✖", "x")).red(),
+                    console::style(resolved.plugin.as_source()).bold(),
+                    console::style("(skipped)").dim(),
+                );
+                for line in explain(&err) {
+                    println!("      {}", console::style(line).red());
                 }
-                Err(err) => {
-                    println!(
-                        "  {} {} {}",
-                        console::style(console::Emoji("✖", "x")).red(),
-                        console::style(plugin.as_source()).bold(),
-                        console::style("(skipped)").dim(),
-                    );
-                    for line in explain(&err) {
-                        println!("      {}", console::style(line).red());
-                    }
+                // The plugin's own account of what went wrong, which is
+                // usually more specific than anything this side can say.
+                for line in err.plugin_stderr().into_iter().flat_map(str::lines) {
+                    println!("      {}", console::style(line).dim());
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Reports what one plugin detected, and what of it a higher-priority channel
+/// already spoke for.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+fn report_detection(
+    resolved: &rattler_virtual_package_plugins::ResolvedPlugin,
+    detection: &rattler_virtual_package_plugins::Detection,
+    show_timings: bool,
+) {
+    let source = if detection.from_cache {
+        "from cache"
+    } else {
+        "ran the plugin"
+    };
+    println!(
+        "  {} {} {}",
+        console::style(console::Emoji("✔", "+")).green(),
+        console::style(resolved.plugin.as_source()).bold(),
+        console::style(format!("({source})")).dim(),
+    );
+
+    if show_timings {
+        let timings = &detection.timings;
+        println!(
+            "      {}",
+            console::style(format!(
+                "repodata {:?}{}, solve {:?}, install {:?}, run {:?}",
+                timings.environment.repodata,
+                if timings.environment.refetched_for_dependencies {
+                    " (two queries: the plugin has dependencies)"
+                } else {
+                    ""
+                },
+                timings.environment.solve,
+                timings.environment.install,
+                timings.run,
+            ))
+            .cyan(),
+        );
+    }
+
+    let used: Vec<_> = detection
+        .virtual_packages
+        .iter()
+        .filter(|detected| resolved.provides.contains(&detected.package.name))
+        .collect();
+    if used.is_empty() {
+        println!(
+            "      {}",
+            console::style(format!(
+                "none of {} are present on this system",
+                resolved
+                    .provides
+                    .iter()
+                    .map(PackageName::as_source)
+                    .join(", ")
+            ))
+            .dim(),
+        );
+    }
+    for detected in used {
+        println!("      {}", console::style(&detected.package).green());
+    }
+
+    // A verdict this plugin gave that another channel's plugin speaks for. It
+    // still had to give one, and saying so beats a silently missing line.
+    for (virtual_package, winner) in &resolved.shadowed_by {
+        println!(
+            "      {}",
+            console::style(format!(
+                "{} is provided by {winner}",
+                virtual_package.as_source()
+            ))
+            .dim(),
+        );
+    }
+}
+
+/// Reports a registration that is not run because another channel speaks for
+/// everything it claimed.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+fn report_shadowed(resolved: &rattler_virtual_package_plugins::ResolvedPlugin) {
+    println!(
+        "  {} {} {}",
+        console::style(console::Emoji("○", "-")).dim(),
+        console::style(resolved.plugin.as_source()).bold(),
+        console::style("(not run)").dim(),
+    );
+    for (virtual_package, winner) in &resolved.shadowed_by {
+        println!(
+            "      {}",
+            console::style(format!(
+                "{} is provided by {winner}",
+                virtual_package.as_source()
+            ))
+            .dim(),
+        );
+    }
 }
 
 /// The message of an error and of every cause beneath it.

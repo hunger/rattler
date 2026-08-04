@@ -18,18 +18,18 @@ beyond the feature flag itself.
 | `Gateway::virtual_package_plugins(channel, platform)` accessor | Implemented |
 | Registrations on `RepoDataQueryOutput`, per channel subdir | Implemented |
 | Inherited and shadowed registrations along the CEP-42 `base` chain | Implemented (reported, not resolved) |
-| Plugin output protocol (JSON Lines) | Implemented |
+| Plugin report protocol (one JSON object) | Implemented |
 | Contract check of output against the registration | Implemented |
 | `ChannelVirtualPackage` result type | Implemented |
 | `rattler virtual-packages -c <channel> [--detect]` | Implemented |
-| Conflict resolution across channels | Deliberately not done -- reported as declared, caller decides |
-| Running a plugin out of an existing environment | Implemented |
+| Conflict resolution across channels | Implemented -- highest-priority channel wins |
+| Running a plugin out of an existing environment, activated | Implemented |
 | Detection result cache | Implemented |
 | Plugin environment creation | Implemented |
 | Detection end to end (orchestration) | Implemented |
 | Solver injection, `CONDA_OVERRIDE_*`, lockfile representation | Not implemented |
 | Trust / opt-in model | Open, blocks execution |
-| prefix.dev upload validation | Not implemented (server side) |
+| prefix.dev upload validation | Proposed, server side; nothing here depends on it |
 
 ### Crate Layout
 
@@ -38,7 +38,8 @@ beyond the feature flag itself.
 | `info.virtual_package_plugins` type and parsing | `rattler_conda_types` | done |
 | `ChannelVirtualPackage` | `rattler_conda_types` | done |
 | Registration accessors and query output | `rattler_repodata_gateway` | done |
-| Output protocol, contract check | `rattler_virtual_package_plugins` | done |
+| Report protocol, contract check | `rattler_virtual_package_plugins` | done |
+| Activating a plugin's prefix (`activation`) | `rattler_virtual_package_plugins` | done |
 | Running a plugin (`runner`) | `rattler_virtual_package_plugins` | done |
 | Environment creation (`environment`) | `rattler_virtual_package_plugins` | done |
 | Orchestration (`detect`) | `rattler_virtual_package_plugins` | done |
@@ -86,9 +87,16 @@ Channel operators register virtual package plugins as part of their channel conf
 prefix.dev. Each registration names a conda package containing the detection logic and lists the
 virtual packages that plugin provides.
 
-During package upload, prefix.dev validates that any virtual package dependency declared in a
-package's metadata has a corresponding plugin registered in the channel. Uploads referencing undefined
-virtual packages are rejected.
+**Proposed, and a server-side policy question rather than part of this design:** that prefix.dev
+validate at upload time that any virtual package a package depends on has a plugin registered in the
+channel, and reject uploads that reference undefined ones. The argument for it is that a server
+should not serve what it knows to be broken. The argument against is that conda already lets you
+upload a package depending on something that does not exist, and this would be the one place that
+rule is tightened.
+
+Nothing in the client depends on the answer. A registration naming a package the channel does not
+ship is reported as exactly that, and a dependency on an unregistered virtual package is simply
+unsatisfiable -- the same as any other missing dependency.
 
 The registration is published in the channel's `repodata.json` under a new `info.virtual_package_plugins`
 field, keyed by **plugin package name**:
@@ -143,32 +151,37 @@ plugin, it:
    itself a solve against a channel whose plugin data is not available yet; restricting it to
    built-ins is what stops the recursion.
 
+   The repodata is read **without the dependency closure** first. A detection plugin should be
+   self-contained, and the common one is: a script with no dependencies at all. Fetching the closure
+   to find that out costs a round trip the answer never needed, so it is only fetched when the
+   plugin's own record names dependencies. `EnvironmentTimings::refetched_for_dependencies` says
+   when that happened.
+
 2. **Identifies the result by a hash over every package in that environment**, not by the plugin
    archive's own `sha256`. What a plugin reports depends on its dependencies, so its identity has to
    change when they do.
 
    This has an ordering consequence worth stating plainly: the hash is not known until the solve has
-   happened, so a cache hit skips the install and the plugin run, never the solve. Against cached
-   repodata the solve is the cheap part.
+   happened, so a cache hit skips the install and the plugin run, never the solve. Measured against a
+   local channel, that solve is under a millisecond -- it resolves one package, not an environment.
 
 3. **Installs it** into a prefix of its own keyed by that hash, separate from the user's environment
    and reused across solves.
 
-4. **Runs the entry point** directly from the prefix's binary directory, with the environment's
-   binary directories prepended to `PATH` and `CONDA_PREFIX` set -- and nothing more. Running the
-   file rather than a shell command avoids quoting surprises and keeps `activate.d` output off the
-   stdout the protocol is parsed from; conda packages resolve their own libraries through `RPATH`,
-   so skipping activation costs little.
+4. **Activates the prefix and runs the entry point** with the environment that produced. The
+   activation happens in a shell of its own; the plugin does not. Running the file rather than a
+   shell command avoids quoting surprises and keeps `activate.d` output off the stdout the report is
+   parsed from, while the plugin still gets everything activation sets.
 
-5. **Reads the verdicts from stdout and checks them against the registration**: exactly one verdict
-   per registered virtual package and nothing besides. A plugin claiming a name its channel never
+5. **Reads the report from stdout and checks it against the registration**: a verdict for every
+   registered virtual package and nothing besides. A plugin claiming a name its channel never
    registered it for is rejected outright rather than filtered -- a channel promising one thing and
    shipping another is a bug worth surfacing, not something to paper over.
 
 6. **Caches the verdicts** under the plugin's own cache policy, keyed by the same hash.
 
 7. **Injects the results** into the solver's virtual package set alongside the built-ins, as
-   `ChannelVirtualPackage`s:
+   `ChannelVirtualPackage`s -- but only the ones this plugin won (see *Conflict Resolution*):
 
 ```rust
 pub struct ChannelVirtualPackage {
@@ -190,48 +203,75 @@ ships an executable `cuda-detect`. Package names are unique within a channel and
 repeat a key, so the entry point needs no separate metadata field, and conda already puts executables
 in the environment's binary directory so no path needs declaring either.
 
-**Output is JSON Lines**, one object per line, so a plugin can report as it discovers and a malformed
-line can be reported with its line number instead of invalidating the whole run:
+**The report is one JSON object**, keyed by virtual package name:
 
-```text
-{"kind": "present", "name": "__cuda", "version": "12.4"}
-{"kind": "present", "name": "__cuda_arch", "version": "0", "build_string": "sm_89"}
-{"kind": "absent", "name": "__rocm"}
-{"kind": "cache", "ttl_seconds": 86400, "watch_paths": ["/sys/module/amdgpu/version"]}
+```json
+{
+  "virtual_packages": {
+    "__cuda": { "version": "12.4" },
+    "__cuda_arch": { "version": "0", "build_string": "sm_89" },
+    "__rocm": null
+  },
+  "cache": {
+    "ttl_seconds": 86400,
+    "watch_paths": ["/sys/module/amdgpu/version"],
+    "watch_env": ["CUDA_VISIBLE_DEVICES"]
+  }
+}
 ```
 
-`absent` is a line kind of its own rather than a `present` line with a null version. A plugin must
-give a verdict on every virtual package its channel registered it for, so "not on this system" has to
-be something it can say out loud -- and a null version cannot carry that, because serde maps a
-missing key and an explicit `null` to the same value. A distinct kind puts the distinction in the wire
-format instead of in a deserializer subtlety. `build_string` is optional and exists because
-`__archspec` and `__cuda_arch` carry their information there rather than in the version.
+`null` is how a plugin says "not on this system". A plugin must give a verdict on every virtual
+package its channel registered it for, so absence has to be something it can state -- and keying by
+name is what lets a `null` carry it: the contract checks which *keys* are present, so a missing key
+is silence and an explicit `null` is a verdict, with no deserializer subtlety in between.
+`build_string` is optional and exists because `__archspec` and `__cuda_arch` carry their information
+there rather than in the version.
 
-At most one `cache` line per run; a second one is an error, since which policy applies would be
-undefined. Unknown line kinds and unknown fields are rejected.
+Keying by name also makes a duplicate verdict impossible to write down, and an object cannot repeat
+its `cache` key, so neither needs detecting.
+
+**Unknown keys are ignored**, at every level of the report, and logged at debug level. A plugin
+written against a newer protocol than the client understands stays usable for the part the two
+agree on. Rejecting the unknown would buy no safety here: the plugin is arbitrary code the client
+has just run, and a protocol that cannot be extended without breaking older clients is worse than
+one that can.
 
 #### The process boundary
 
-The entry point is invoked **directly, not through a shell**. A shell would run the environment's
-`activate.d` scripts, and anything those print lands on the same stdout the protocol is parsed from, so a
-chatty activation script would corrupt a plugin's output. What that gives up is limited: conda packages
-resolve their own libraries through `RPATH`, so only a plugin relying on `activate.d` side effects would
-notice.
+**The prefix is activated, and the plugin is invoked directly.** These are two separate things, and
+keeping them separate is what makes both possible.
+
+Activation runs in a shell of its own, via `Activator::run_activation`, which brackets the activation
+script between two dumps of the environment and diffs them. What comes back is the set of variables
+activation changed; what an activation script *printed* stays on that shell's stdout and is
+discarded. The plugin is then started as a plain process with those variables applied, so nothing an
+activation script says can reach the stream the report is read from, and no quoting question arises
+about the plugin's own invocation.
+
+The alternative -- running the plugin as a command inside an activated shell -- would put both on the
+same stdout, which is what the earlier draft avoided by not activating at all. Not activating is the
+wrong trade: a package may ship `activate.d` scripts or `state.json` variables that its programs
+expect, and a plugin that alone does not get them behaves unlike every other program in a conda
+environment.
 
 The plugin therefore sees:
 
 - **stdin** connected to `/dev/null`
-- the parent's environment, with the plugin environment's binary directories prepended to `PATH` and
-  `CONDA_PREFIX` set to the prefix
+- the parent's environment, plus everything activating the prefix changed -- which includes the
+  prefix's binary directories at the front of `PATH` and `CONDA_PREFIX` pointing at it
 - nothing else -- no arguments, no configuration file, no environment variable of its own
 
-Entry-point lookup uses the same directories activation would put on `PATH`
+A failing activation script fails the detection rather than being skipped: a plugin run with a
+half-applied environment would report something that depends on how far the script got.
+
+Entry-point lookup happens *before* activation, since a registration naming a package that ships no
+executable is worth saying at once. It uses the same directories activation puts on `PATH`
 (`rattler_shell::activation::prefix_path_entries`), and on Windows also tries `.exe`, `.bat` and `.cmd`.
 
 The contract:
 
 - **stdin**: empty
-- **stdout**: JSON Lines as above
+- **stdout**: one JSON report as above
 - **stderr**: diagnostic output, logged at debug level
 - **exit 0**: the plugin ran and its output is authoritative
 - **exit non-zero**: plugin failure, reported as a distinct error rather than an empty result. Every
@@ -244,19 +284,52 @@ This replaces the draft's three-way exit code (`0` present / `1` absent / `2+` f
 virtual packages per plugin, presence is per verdict and cannot be carried by one exit status:
 `__cuda` may be present while `__cuda_arch` is not.
 
-**The run is bounded.** A plugin still running after **one second** is killed and reported as an
-error: it is meant to read a version file or query a driver, and one that needs longer would stall
-every solve that runs it. So is a plugin that produces more output than its registration can need:
-**8 KiB per registered virtual package, plus two lines of headroom** -- one for the cache policy, one
-of slack -- counted across stdout and stderr together. The 8 KiB per line is not tight. A verdict
-line cannot get long, since a package's name, version and build string together fit in an archive
-file name, which caps them at under 250 bytes; what can get long is a `cache` line watching a
-filesystem path, at most `PATH_MAX` (4096 bytes on Linux), and 8 KiB fits one maximal path with
-every byte JSON-escaped.
+**The run is bounded.** A plugin still running when its timeout elapses is killed and reported as an
+error: detection happens on the way into a solve, and a plugin that hangs would hang the solve with
+it.
 
-**Validation is exact.** Every registered name gets exactly one verdict; a duplicate, a name that was
-never registered, or silence about one that was, each fail the run. A machine without the hardware is
-the ordinary case and passes: every name still gets a verdict, they are simply all `absent`.
+**How long that is, is the caller's to decide, within a ceiling.** A plugin reading a version file is
+done in microseconds; one connecting to a GPU has been measured at over a second on Windows. No
+single number fits both, so the bound is a `RunTimeout` the caller passes in, and nothing a plugin or
+a channel says can raise it. `rattler virtual-packages --detect --plugin-timeout <SECONDS>` is where
+that surfaces today.
+
+- **Default: five seconds.** One second was provably too short -- `__cuda` on Windows misses it by
+  half a second, because it has to connect to the GPU. Five leaves room on cold hardware while still
+  being short enough that a hung plugin is noticed rather than waited out.
+- **Maximum: sixty seconds**, and a caller cannot pass it. `RunTimeout::new` clamps, and it is the
+  only way to construct one, so there is no path in the API to an unbounded plugin run -- not by
+  configuration, not by a caller's arithmetic. Asking for more is clamped and logged rather than
+  refused: a caller asking for ten minutes has misjudged how long detection takes, and running with
+  a minute is a better answer than an error about a number.
+
+The asymmetry is what sets the ceiling: a timeout that is too short only skips one plugin, while an
+unbounded one stalls every solve on the machine.
+
+**One bound covers activation and the run together.** A caller allowing five seconds is allowing five
+seconds to get an answer, not five for each half, so the timeout becomes a deadline before the shell
+starts and the plugin gets what is left of it. A slow activation and a slow plugin are still told
+apart in the error. An activation that runs out of time leaves its shell running: a blocking call
+cannot be cancelled, and killing a half-finished activation script would be worse than letting it
+finish into a result nobody reads.
+
+A plugin producing more output than its registration can need is killed the same way:
+**8 KiB per registered virtual package, plus two of headroom** -- one for the cache policy, one of
+slack -- counted across stdout and stderr together. That is not tight. A verdict cannot get long,
+since a package's name, version and build string together fit in an archive file name, which caps
+them at under 250 bytes; what can get long is a watched filesystem path, at most `PATH_MAX` (4096
+bytes on Linux), and 8 KiB fits one maximal path with every byte JSON-escaped. Unlike the timeout,
+this is not configurable -- nothing has asked for it, and a plugin needing more is misbehaving rather
+than unlucky.
+
+**Every failure carries what the plugin said.** A killed plugin's stderr is collected as it arrives
+rather than at the end, so a plugin that explains itself and *then* hangs is reported with the
+explanation. It is kept out of the error message and offered as `DetectError::plugin_stderr`, since
+it is the plugin's text rather than rattler's and can run to several lines.
+
+**Validation is exact.** Every registered name gets a verdict; a name that was never registered, or
+silence about one that was, each fail the run. A machine without the hardware is the ordinary case
+and passes: every name still gets a verdict, they are simply all `null`.
 
 Plugins can be compiled binaries, shell scripts, or anything else that fits in a conda package.
 Keeping the interface this simple means detection for a new accelerator is a single small package with
@@ -322,6 +395,9 @@ channel must not be able to place a file outside the cache directory.
   "expires_at": 1785501271,
   "watched": [
     { "path": "/sys/module/amdgpu/version", "modified_ms": 1785497600000 }
+  ],
+  "watched_env": [
+    { "name": "CUDA_VISIBLE_DEVICES", "value": null }
   ]
 }
 ```
@@ -329,13 +405,34 @@ channel must not be able to place a file outside the cache directory.
 - **`virtual_packages`** -- the verdicts, each carrying provenance. `package` is the
   `name=version=build_string` form, with the build string omitted when empty. `plugin_sha256` identifies
   the plugin environment rather than the plugin archive.
-- **`expires_at`** -- seconds since the Unix epoch, derived from the `ttl_seconds` the plugin asked for.
-  `null` means no time limit, so only `watched` can invalidate the entry.
+- **`expires_at`** -- seconds since the Unix epoch, derived from the `ttl_seconds` the plugin asked
+  for. Every entry has one: **a plugin cannot ask to be cached forever.** What it can do is ask for
+  longer or shorter, within a maximum, and add watches that expire the entry *sooner*.
+
+  - A plugin that declares no policy, or declares one without `ttl_seconds`, gets **one hour**. The
+    plugin that thought least about caching must not be the one whose answers are kept longest, and
+    an hour costs at most one plugin run per hour -- against a prefix that already exists, that is
+    milliseconds.
+  - A plugin asking for more than **thirty days** gets thirty days. Without a ceiling a channel could
+    pin a verdict on a machine for as long as it liked, and a driver upgrade would go unnoticed until
+    someone cleared the cache by hand.
+  - `ttl_seconds: 0` is honoured as written: a plugin saying "do not reuse this" is not overridden
+    into the default.
+
+  The field is nullable in the cache format because `rattler_cache` is a general store that knows
+  nothing about the plugin protocol. The client never writes a null.
 - **`watched`** -- one entry per path the plugin asked to have watched, recording its modification time in
   milliseconds since the epoch, or `null` if it did not exist. Either changing invalidates the entry, so a
   driver appearing counts as much as one being upgraded -- the case a TTL cannot catch.
+- **`watched_env`** -- one entry per environment variable the plugin asked to have watched, recording its
+  value or `null` if it was not set. This catches what no path can: the hardware still being there while
+  the user has hidden it, as `CUDA_VISIBLE_DEVICES` does.
 
-An entry is a miss if it is absent, expired, has a changed watched path, **or fails to parse**. A corrupt
+  These are read from the process that runs the plugin, not from the plugin's activated environment.
+  The activated one is already covered by the environment hash the entry is keyed on; the process's own
+  is what a user changes between two solves.
+
+An entry is a miss if it is absent, expired, has a changed watch, **or fails to parse**. A corrupt
 cache file costs one plugin run; failing a solve over it would be worse.
 
 A changed *registration* does not invalidate an entry: the key covers the channel, the plugin and its
@@ -379,20 +476,21 @@ happened, and tell a broken plugin from a broken channel.
 
 | Condition | Outcome |
 | --- | --- |
-| No executable named after the plugin package in the prefix | Error naming what was looked for and where |
+| No executable named after the plugin package in the prefix | Error naming what was looked for and where, raised before anything is activated |
+| An activation script fails | Error, carrying the script's own output. The plugin is not run: what it reported would depend on how far the script got |
+| Activation is still running when the deadline passes | Error naming the prefix and the budget, distinct from the plugin timing out. Its shell is left to finish |
 | The executable exists but cannot be started | Error, wrapping the OS error |
 | Exit code other than `0`, or death by signal | Error carrying the code and the plugin's stderr. The plugin ran and said no; whether to downgrade that to "these virtual packages are absent" is the caller's decision, since a machine without the hardware looks the same from here |
-| Still running after one second | Error. The plugin is killed; a hanging plugin must not hang the solve with it |
-| More output than the registration can need | Error. The plugin is killed once it exceeds its budget, one line's worth per registered virtual package plus headroom (see the contract) |
+| Still running when the caller's timeout elapses | Error carrying the timeout and the stderr it wrote before it hung. The plugin is killed; a hanging plugin must not hang the solve with it |
+| More output than the registration can need | Error carrying the budget and the stderr written so far. The plugin is killed once it exceeds one verdict's worth per registered virtual package plus headroom (see the contract) |
 
-**Reading the output**
+**Reading the report**
 
 | Condition | Outcome |
 | --- | --- |
-| A line that is not a valid protocol object | Error carrying the 1-based line number, so it can be found in a log |
-| An unknown line kind, or an unknown field | Error: both are rejected rather than ignored |
-| More than one `cache` line | Error naming the second one's line; which policy applied would otherwise be undefined |
-| No output at all | Not a failure, but the contract below then rejects it for saying nothing about names it was registered for |
+| Not a JSON object, or a verdict without a version | Error carrying serde's line and column, so it can be found in a log |
+| An unknown key, at any level | Not a failure: ignored, and logged at debug level so a misspelled key is findable |
+| Nothing on stdout | Error of its own. A plugin that exits zero having said nothing has usually written its report to the wrong stream, and saying that beats reporting it as silence about every registered name |
 
 **Checking the contract**
 
@@ -400,7 +498,6 @@ happened, and tell a broken plugin from a broken channel.
 | --- | --- |
 | A virtual package the channel did not register | Error listing every offending name |
 | Silence about one the channel did register | Error listing every missing name |
-| The same virtual package reported twice | Error, reported ahead of the other two, since a duplicate makes them ambiguous |
 
 **Caching the result**
 
@@ -430,7 +527,37 @@ view a solve sees, so it also covers channels discovered through CEP-42 that the
 
 Duplicate claims are preserved verbatim in both: two channels each claiming `__rocm`, or two plugins
 within one channel each claiming `__rocm`, all come back, and no warning is raised. Deciding which
-plugin wins is the caller's job.
+plugin wins happens a layer up, in `resolve`.
+
+### Conflict Resolution
+
+Two channels may each register a plugin for `__rocm`, and nothing in the metadata prevents it.
+`resolve::resolve_plugins` decides between them, and the rule is the one channels already follow
+everywhere else: **the highest-priority channel wins**. It takes the registrations in resolved
+channel-priority order -- what `RepoDataQueryOutput::virtual_package_plugins` yields -- and walks
+them in order, giving each virtual package to the first channel that claims it.
+
+Three things fall out of that, and each is deliberate:
+
+**Subdirs of one channel are folded, not compared.** A channel repeats its registration in every
+subdir, so the same plugin seen twice is one plugin, and what it is registered for is the union of
+what its subdirs said.
+
+**Two plugins in one channel claiming one name is an error**, not a contest. There is no priority to
+break that tie, and a channel registering both `a-detect` and `b-detect` for `__rocm` is
+contradicting itself. Detection fails rather than guessing, and it fails before any of that
+channel's plugins runs.
+
+**A plugin can lose one name and keep another.** It still runs, for what it won, and it is still
+held to *everything* its channel registered it for: the contract is between the plugin and its
+channel, and losing `__rocm` to a higher-priority channel does not excuse the plugin from giving a
+verdict on it. The verdict is simply discarded. A plugin that loses every name is not run at all --
+but it is still returned, in `Resolution::shadowed`, so a caller can say a registration was skipped
+and which channel took it, rather than leaving a user to wonder where their plugin went.
+
+What this does *not* decide is whether a plugin may speak for a virtual package clients detect
+themselves, such as `__cuda` or `__glibc`. That policy is still open (see the open questions);
+shadowing of that kind is reported by `rattler virtual-packages` and nothing acts on it.
 
 `resolve_channel_relation` is exported so a caller resolving a CEP-42 `base`/`overrides` reference
 outside a query resolves it the same way the query path does. That validation stops malicious metadata
@@ -454,9 +581,23 @@ answer was cached or freshly produced:
 ```
 
 A plugin that fails is reported and skipped rather than aborting the run: one broken plugin should not
-hide what the others found. `--detect` takes a single platform, since detection inspects the running
-machine. Unlike the listing mode it does not walk the `base` chain: only plugins the named channels
-register themselves are run.
+hide what the others found. Where a plugin fails after starting, its own stderr is printed beneath the
+error -- usually the more specific account of the two. `--detect` takes a single platform, since
+detection inspects the running machine. Unlike the listing mode it does not walk the `base` chain:
+only plugins the named channels register themselves are run.
+
+Conflicts are resolved across every named channel before anything runs, in the order the channels
+were given, so a registration a higher-priority channel already speaks for is reported rather than
+run:
+
+```
+🔌 file:///.../virtual-package-plugins-base/ [linux-64]
+  ✔ cuda-detect (ran the plugin)
+      __cuda=12.4
+🔌 file:///.../virtual-package-plugins-derived/ [linux-64]
+  ○ vendor-cuda-detect (not run)
+      __cuda is provided by file:///.../virtual-package-plugins-base/
+```
 
 A registration naming a package the channel does not have is reported as exactly that, rather than as a
 failure to resolve dependencies -- it is a disagreement between a channel's metadata and its packages, and
@@ -497,15 +638,29 @@ packages need to select against.
 A `cuda-detect` package registered as `cuda-detect -> ["__cuda", "__cuda_arch"]` queries the driver
 once and reports both the driver version and the compute capability:
 
-```text
-{"kind": "present", "name": "__cuda", "version": "12.4"}
-{"kind": "present", "name": "__cuda_arch", "version": "0", "build_string": "sm_89"}
+```json
+{
+  "virtual_packages": {
+    "__cuda": { "version": "12.4" },
+    "__cuda_arch": { "version": "0", "build_string": "sm_89" }
+  }
+}
 ```
 
-On a machine with no NVIDIA driver the same plugin exits 0 and reports both as `absent` -- it still
-has to account for every name it was registered for. Under the draft's original
+On a machine with no NVIDIA driver the same plugin exits 0 and reports both as `null` -- it still has
+to account for every name it was registered for. Under the draft's original
 one-plugin-per-virtual-package scheme this needed two packages, or one package with two entry points
 repeating the same driver query.
+
+**A plugin is never asked for a subset.** `__cuda_arch` costs a driver connection, so it is fair to
+ask whether a client that only needs `__cuda` could say so and save the work. It cannot, and
+deliberately: grouping names under one plugin *is* the statement that they share their expensive
+work, and splitting the cost is what separate plugin packages are for. A per-run subset would also
+make the caching worse rather than better -- the cache key would have to cover the requested subset,
+so asking for `__cuda` and later for both would query the driver twice over.
+
+A channel that would rather pay twice can ship two plugins. `__cuda` and `__cuda_arch` under one is
+the arrangement that motivated grouping in the first place: one driver connection, two answers.
 
 ### Settled Decisions
 
@@ -517,20 +672,27 @@ repeating the same driver query.
    `index.json` are untouched, so a client learns what a plugin provides without fetching the plugin's
    record first.
 4. **No version constraints in the registration.** Bare package name, latest version.
-5. **The gateway reports, it does not decide.** Registrations come back per subdir in channel-priority
-   order with duplicates intact.
+5. **The gateway reports, `resolve` decides.** Registrations come back per subdir in channel-priority
+   order with duplicates intact; the highest-priority channel wins each contested name.
 6. **Plugin identity is (channel, package name)** for conflict resolution, and a hash over the whole
    solved plugin environment for caching, so it changes when a dependency does.
-7. **Output is JSON Lines with `present`/`absent`/`cache` line kinds.** Absence is stated explicitly,
-   never implied by omission.
-8. **Validation is exact**: one verdict per registered name, nothing else, silence included.
-9. **The entry point runs from the prefix's binary directory** with `PATH` and `CONDA_PREFIX` set,
-   rather than as a shell command in an activated environment.
-10. **Detection is host-only**: the plugin environment is solved for the current platform.
-11. **The plugin declares its own cache policy** (`ttl_seconds`, `watch_paths`) as a line of output.
-12. **Results carry provenance** as `ChannelVirtualPackage`; the solver still receives plain
+7. **The report is one JSON object keyed by virtual package name**, with `null` for absent. Absence
+   is stated explicitly, never implied by omission, and a duplicate verdict cannot be expressed.
+8. **Unknown keys are ignored, not rejected**, so the protocol can grow without breaking older
+   clients.
+9. **Validation is exact**: a verdict per registered name, nothing else, silence included.
+10. **The prefix is activated in a shell of its own, and the plugin then runs directly** with the
+    environment that produced -- rather than as a command inside that shell.
+11. **Detection is host-only**: the plugin environment is solved for the current platform.
+12. **The plugin declares its own cache policy** (`ttl_seconds`, `watch_paths`, `watch_env`) in its
+    report, within bounds the client sets: every entry expires, in an hour by default and thirty
+    days at the most.
+13. **Results carry provenance** as `ChannelVirtualPackage`; the solver still receives plain
     `GenericVirtualPackage`s.
-13. **Everything is behind an experimental cargo feature** and invisible when it is off.
+14. **A plugin is never asked for a subset of what it was registered for.** Grouping names under one
+    plugin is the statement that they share their expensive work; splitting the cost is what
+    separate plugin packages are for.
+15. **Everything is behind an experimental cargo feature** and invisible when it is off.
 
 ### Open Questions
 
@@ -569,3 +731,359 @@ repeating the same driver query.
 11. **Concurrent detections.** Nothing serializes two processes preparing the same plugin
     environment: the sentinel keeps a half-installed prefix from being *used*, not two installers
     from interleaving. The package cache below it locks; the prefix itself does not.
+
+---
+
+## Review Comments
+
+Comments left on this document during the review of 2026-07-31, grouped into threads, with the
+resolution of each. Quotes from Bas Zalmstra were left as replies quoting his inline comments, and
+are attributed to him here. Each thread says what changed and where; the body above describes the
+state after everything marked **done**.
+
+### 1. Output format: JSON Lines or one JSON object -- done
+
+> **Wolf Vollprecht** (on *malformed*) -- Why not just normal JSON? JSON object or array would be
+> much easier IMO.
+>
+> **Tobias Hunger** -- Because I can parse an object on each line break and do not need to wait for
+> the entire thing to finish. But yes: an object works as well. Should be easy to change.
+> I originally did not have a timeout for the plugin and thought it might be better to get results
+> as they come in instead of having to wait for the entire thing to be written. I added a timeout of
+> 1s later, so that is a non-issue now.
+
+**Done: switched to one JSON object.** Streaming was the only argument for JSON Lines and the
+timeout removed it. The replacement keys the verdicts by virtual package name, which makes a
+duplicate verdict impossible to express rather than something the contract has to catch:
+
+```json
+{
+  "virtual_packages": {
+    "__cuda": { "version": "12.4" },
+    "__cuda_arch": { "version": "0", "build_string": "sm_89" },
+    "__rocm": null
+  },
+  "cache": { "ttl_seconds": 86400, "watch_paths": ["/sys/module/amdgpu/version"] }
+}
+```
+
+`null` is `absent`. It works here where it did not work per line: the contract checks the *key set*
+against the registration, so a missing key is still silence and an explicit `null` is still a
+verdict -- the distinction serde could not carry when it was a missing field versus a null field.
+The `present`/`absent`/`cache` line kinds all disappear with it, and so does the duplicate-cache-line
+error, since an object cannot have two `cache` keys.
+
+`PluginLine`, `PluginOutput`, `Verdict` and `parse_output` collapse into `PluginReport` and
+`parse_report`; `ContractViolation::Duplicated` is gone, since nothing can express a duplicate any
+more. One case is new: a plugin that exits zero having written nothing is now its own error rather
+than silence about every registered name, because writing the report to stderr by mistake is a
+mistake worth naming.
+
+The fixture plugin package is rebuilt from
+`test-data/channels/virtual-package-plugins/regenerate.py`, which also updates the hashes in
+`info/paths.json` and `repodata.json`. It was hand-built before, and getting the protocol wrong in a
+binary fixture is expensive to notice.
+
+### 2. Rejecting unknown line kinds and unknown fields -- done
+
+> **Wolf Vollprecht** (on *known line kinds and unknown*) -- This seems a bit counter to what we do
+> in Pixi. I don't really understand the reasoning. We do this all the time and should be able to
+> work around this if it is really an issue.
+>
+> **Tobias Hunger** -- I asked Claude to be paranoid when doing this. A plugin might be malicious
+> after all. We can lift that restriction if we can all agree that is not a problem.
+
+**Done: lifted.** Strictness buys nothing against a malicious plugin -- it already runs arbitrary
+code -- and it costs forward compatibility: an older client would reject a plugin written for a
+newer protocol outright rather than ignoring the part it does not understand. Unknown keys are now
+ignored and logged at debug level, at both levels of the report, so a misspelled `ttl_seconds` is
+still findable instead of silently meaning "no expiry".
+
+What stays strict is the contract: a verdict about a virtual package the channel never registered the
+plugin for is still an error, because that is a channel disagreeing with itself rather than a version
+skew.
+
+### 3. Conflict resolution across channels -- done
+
+> **Wolf Vollprecht** (on *Deliberately not done -- reported as declared, caller decides*) --
+> I think we said "highest priority channel wins"?
+>
+> **Tobias Hunger** -- Yes, we did and that is the implementation I will add next. I wanted to see
+> the plugins running and caching their results (so we do not rerun them all the time!) first.
+
+**Done.** `RepoDataQueryOutput::virtual_package_plugins` already returned registrations in resolved
+channel-priority order, so the new `resolve` module walks them in that order and gives each virtual
+package to the first channel that claims it. Two plugins *within one channel* claiming the same name
+are an error -- there is no priority to break that tie, and it is a mistake in the channel.
+
+Two cases the thread did not cover, decided while building it:
+
+- A plugin that loses *some* of its names still runs for the rest, and is still held to everything
+  its channel registered it for. The contract is between the plugin and its channel; the verdicts
+  for lost names are simply discarded.
+- A plugin that loses *all* of them is not run, but is still returned in `Resolution::shadowed`, so
+  `--detect` can say the registration was skipped and which channel took it. Dropping it silently
+  would leave a user wondering where their plugin went.
+
+`rattler virtual-packages --detect` now resolves across all the channels it was given before running
+anything, rather than running each channel's registrations independently. Whether a plugin-provided
+name may shadow a *built-in* one is a separate question and stays open (see below).
+
+### 4. The one-second timeout -- done
+
+> **Tobias Hunger** -- I reject a plugin now if it reaches a timeout of 1s or produces too much
+> output (8k per expected line + 16k). We should probably discuss these limits. 1s might be a bit
+> short on slow HW. Maybe we should make that configurable (up to a certain limit)?
+>
+> **Bas Zalmstra** -- On Windows I have seen the `__cuda` virtual package take 1.5 seconds to load.
+> This is because it has to connect to the GPU.
+>
+> **Tobias Hunger** -- Yes, we need to discuss this: either make it configurable within certain
+> limits or just increase the default value.
+
+**Both.** One second is provably too short: the flagship use case misses it by half a second on
+Windows.
+
+Done: the bound is now a `RunTimeout` the caller passes in, through `DetectOptions` and on to
+`run_plugin`, rather than the `RUN_TIMEOUT` constant it used to be. `rattler virtual-packages
+--detect --plugin-timeout <SECONDS>` exposes it; on the pixi side it would be a config key. Nothing
+a plugin or a channel writes can influence it -- only the caller.
+
+The numbers are settled too: **five seconds by default, sixty at most**. The default had to clear
+the case Bas measured, and five seconds leaves a GPU query room on cold hardware. The maximum is
+enforced by the type -- `RunTimeout::new` clamps and is the only constructor -- so no configuration,
+and no caller's arithmetic, can produce a longer one.
+
+Activation did not get a budget of its own in the end (see thread 7): it runs inside the same
+deadline, so five seconds means five seconds to an answer rather than five per half.
+
+### 5. Output limits -- done
+
+Same thread as above: **8 KiB per registered virtual package plus two lines of headroom**, counted
+across stdout and stderr together.
+
+**Kept, and not made configurable.** With one JSON document the "per line" framing goes away, but
+the size does not need to change: the reasoning behind 8 KiB was one maximal `PATH_MAX` watch path
+with every byte JSON-escaped, and the format does not affect that. Unlike the timeout it gets no
+knob -- nobody has asked for one, and a plugin that needs more is misbehaving rather than unlucky.
+`MAX_LINE_BYTES` is renamed `MAX_BYTES_PER_VIRTUAL_PACKAGE`, which is what it always meant.
+
+The defect in the same thread is fixed: `runner.rs` used to drop the captured stderr on the timeout,
+over-budget and read-error paths, so exactly the failures a plugin author most needs to debug were
+the ones that said nothing. The output buffers now outlive the collecting, so a plugin that
+complains and *then* hangs is reported with the complaint. Nothing is truncated: the budget already
+caps how much there can be.
+
+### 6. Who consumes the provenance -- done
+
+> **Bas Zalmstra** -- Then who consumes this provenance?
+>
+> **Tobias Hunger** -- We can end up with several channels having the "same" plugin. I added this to
+> be able to distinguish between those.
+
+**No change, and the consumer now exists.** Conflict resolution (thread 3) is what reads it: which
+channel a verdict came from is exactly what decides whether it is used or discarded, and
+`Resolution::shadowed_by` names the winner so a skipped registration can be explained rather than
+just omitted.
+
+### 7. Activation scripts -- done
+
+> **Bas Zalmstra** -- I don't really see the downside of running the activation scripts. We always
+> do this and have more than enough experience with quoting in other places. I think it would be
+> confusing if they are not run.
+>
+> **Bas Zalmstra** -- We could first run the activation scripts, then print a marker, and then
+> directly execute the plugin executable. It should then be easy to distinguish one from the other.
+>
+> **Tobias Hunger** -- You are right: we should. Activation scripts should not slow down the overall
+> plugin discovery: they get validated for that. We can also add a timeout when running the script,
+> just to be sure.
+>
+> **Tobias Hunger** (on the marker) -- That would probably be safer: who knows what people will use
+> to write plugins with.
+
+**Done: they are run.** The marker approach already existed in rattler and did not even need the
+plugin's own stdout to be involved: `Activator::run_activation`
+(`crates/rattler_shell/src/activation.rs:617`) brackets the activation script with a separator, diffs
+the environment before against after, and hands back the changed variables. The plugin is still
+spawned directly, now with that environment applied -- so activation output lands on the activation
+shell's stdout, never on the stream the report is read from, and the plugin still never runs under a
+shell.
+
+The new `activation` module holds it. A failing activation script fails the detection rather than
+being skipped, since a plugin run with a half-applied environment reports something that depends on
+how far the script got.
+
+Bounding it needed a decision the thread did not settle: whether activation gets a budget of its
+own. It does not -- it runs inside the run's, which becomes a deadline before the shell starts. A
+caller allowing five seconds is allowing five seconds to get an answer, and two separate five-second
+bounds would quietly mean ten. The error still says which half ran out.
+
+The cost is one extra shell per plugin run, on a cache miss only. `run_activation` is blocking and
+cannot be cancelled, so an activation that overruns leaves its shell to finish into a result nobody
+reads.
+
+### 8. Watching environment variables -- done
+
+> **Bas Zalmstra** -- We should also allow watching environment variables probably.
+>
+> **Tobias Hunger** -- Yes, we should.
+
+**Done.** `watch_env` sits alongside `watch_paths` in the cache policy, and `watched_env` in the
+cache entry records each variable's value -- or its absence, the same way `WatchedPath` records a
+missing file. Setting, changing or unsetting one invalidates the entry.
+
+The variables watched are the ones in the process that runs the plugin, not in its activated
+environment: those are what a user changes between two solves, and the activated ones are already
+covered by the environment hash the entry is keyed on.
+
+`CachedDetection::record` now takes a `WatchList` rather than a list of paths, so the next kind of
+watch does not change every caller again.
+
+One thing worth knowing for anyone extending this: `WatchedEnv` reads through an injectable lookup,
+and the tests use their own rather than the real environment. Setting a variable to test it would
+mutate state every other thread in the test binary shares, which is how an unrelated test starts
+failing once a week.
+
+### 9. The cost of solving and installing a plugin environment -- measured, partly addressed
+
+> **Bas Zalmstra** -- This part worries me. Because it will involve extra roundtrips to the server
+> and a complete solve. That adds significant overhead, but we should measure that.
+>
+> **Tobias Hunger** -- How would you expect to solve this? It's a normal package, can we do a
+> fastpath install? That would require us to limit the features the package is allowed to use,
+> wouldn't it?
+
+**Measured first.** The four stages -- repodata, solve, install, run -- are timed and travel with the
+result as `DetectionTimings`. `rattler virtual-packages --detect --timings` prints them.
+
+Against the local fixture channel, with the package cache warm and the prefix already installed:
+
+```
+repodata 1.5ms, solve 0.8ms, install 0ns, run 10.7ms      (verdicts computed)
+repodata 1.5ms, solve 0.6ms, install 0ns, run 0ns         (verdicts from cache)
+```
+
+Two things that says. The solve Bas worried about is **sub-millisecond** here -- it resolves one
+package against one channel, which is nothing like a real environment solve. And the plugin *run*,
+at ~11ms, is the largest stage, most of it the activation shell added in thread 7. That is the
+honest local number; a remote channel would move the weight into repodata, which is where the
+measurement needs repeating.
+
+**Fixed: the second repodata round trip for the common plugin.** `ensure_plugin_environment` used to
+ask for the plugin's whole dependency closure. It now asks for the plugin alone, and only goes back
+for the closure when the plugin's own record names dependencies -- which a self-contained detection
+plugin does not. Nothing about plugin packages is restricted: one with dependencies still works, it
+just costs the extra query, and says so in its timings.
+
+**Not done, and now clearly not urgent:**
+
+- *Passing the caller's already-fetched `RepoData` in* rather than querying at all. This only pays
+  off once a solve integration exists to pass it, and the measurement says the query is not what
+  hurts.
+- *A pre-solve cache level* keyed on (channel, plugin, repodata revision), so a warm run skips the
+  solve too. At sub-millisecond, the solve does not justify it yet.
+
+### 10. Upload-time validation of virtual package dependencies -- documented, still theirs to decide
+
+> **Bas Zalmstra** -- I don't know if we need to verify this explicitly. You can also upload packages
+> that reference nonexisting packages.
+>
+> **Tobias Hunger** -- The server side should IMHO verify that: a server should not serve things it
+> knows to be broken. The client handles this fine already: it errors out on the plugin (and all the
+> virtual packages it is supposed to provide).
+
+**Unresolved, and nothing in this branch depends on it.** It is a prefix.dev policy question, not a
+client one. The client behaviour is already the conservative one either way: a registration naming a
+package the channel does not ship is reported as exactly that
+(`EnvironmentError::PluginPackageMissing`), and a dependency on an unregistered virtual package is
+simply unsatisfiable. The section above now describes the validation as a proposed server-side
+policy, with both arguments, rather than as settled design.
+
+### 11. Capturing stderr -- done
+
+> **Bas Zalmstra** -- Do we capture stderr, so we can pass that along to the user?
+>
+> **Tobias Hunger** -- I need to check but I think it gets captured. It is counted towards the
+> output limit for sure :-)
+
+**It was captured but not passed along.** It lives in `PluginRun::stderr`, is logged at debug level
+on a successful run, and is carried in `DetectError::PluginFailed` on a non-zero exit -- but it was
+dropped on the timeout, over-budget and read-error paths, and no caller ever showed it.
+
+Both halves are fixed now. Every runner error carries the stderr collected before the failure, and
+`DetectError::plugin_stderr` offers it whatever the failure was, so `--detect` can print a plugin's
+own account of itself under the error rather than only rattler's summary of it.
+
+### 12. Telling a plugin which virtual packages to resolve -- rejected, documented
+
+> **Bas Zalmstra** -- Should we instruct the plugin which plugins we want it to resolve? There is
+> overhead in resolving virtual packages. For instance `__cuda_arch` requires connecting to the GPU
+> which is expensive.
+>
+> **Tobias Hunger** -- I expect that to be two plugins then. I added the "a plugin can have several
+> virtual packages" mechanism so we do not end up having plugin A do some expensive operation and
+> report one of two facts that depend on that operation, and then have to run plugin B, which
+> repeats that expensive operation to report the other fact.
+
+**Rejected, deliberately.** Splitting cost is what separate plugin packages are for; grouping names
+under one plugin is the statement that they share their expensive work. A per-run subset would make
+the caching worse, not better: the cache key would have to cover the requested subset, so asking for
+`__cuda` and then for both would run the plugin twice over the same driver query.
+
+`__cuda` and `__cuda_arch` specifically are the case Bas names, and they are also the case that
+motivated grouping -- one driver connection answering both. Splitting them into two packages is
+available to a channel that would rather pay twice. The reasoning is written into the body, under
+*One Plugin, Several Virtual Packages*, since it is a question that will come back.
+
+### 13. How the cache policy is determined -- done
+
+> **Bas Zalmstra** -- How is the plugin's cache policy determined?
+>
+> **Tobias Hunger** -- Plugins can pass the cache policy along with their results.
+
+**Already the design, and the hole in it is fixed.** A plugin that declared no policy used to get
+`CachePolicy::default()` -- no TTL and no watches, so cached forever, for the plugin that thought
+least about caching.
+
+Every entry now has an expiry, and "cache these forever" is not something a plugin can ask for:
+
+- no policy, or a policy without `ttl_seconds`, means **one hour**
+- more than **thirty days** is clamped to thirty days, so a channel cannot pin a stale verdict on a
+  machine and leave a driver upgrade unnoticed until someone clears the cache by hand
+- `ttl_seconds: 0` is honoured as written; a plugin saying "do not reuse this" is not overridden
+
+`watch_paths` and `watch_env` still only make an entry expire *sooner*, never later.
+
+### Numbers chosen, and open to argument
+
+Four numbers were picked while implementing this rather than agreed in the review. Each is a
+one-line change if the answer should be different:
+
+| Number | Value | Why |
+| --- | --- | --- |
+| Default plugin timeout | 5s | Clears the 1.5s `__cuda` case Bas measured, with room on cold hardware |
+| Maximum plugin timeout | 60s | Past anything detection should need, so hitting it means hung |
+| Default cache TTL | 1 hour | Bounds staleness at roughly one plugin run per hour |
+| Maximum cache TTL | 30 days | Long enough for something that never changes, short enough to self-heal |
+
+### Still open
+
+Whether a plugin-provided virtual package may shadow one clients detect themselves (`__cuda`,
+`__glibc`). Shadowing between *channels* is now resolved by priority, but shadowing a **built-in** is
+a different question: nothing acts on it, and `rattler virtual-packages` only warns. This is open
+question 7 above.
+
+### Order of work
+
+| Step | Change | Threads | State |
+| --- | --- | --- | --- |
+| 1 | One JSON object, lenient about unknown keys | 1, 2 | Done |
+| 2 | Caller-set timeout; stderr on every failure path | 4, 5, 11 | Done |
+| 3 | Run activation scripts, bounded, via `run_activation` | 7 | Done |
+| 4 | `watch_env` | 8 | Done |
+| 5 | Conflict resolution: highest-priority channel wins | 3, 6 | Done |
+| 6 | Measure the four stages, then the no-dependency fast path | 9 | Done |
+| 7 | Document the rejected and deferred decisions in the body | 10, 12 | Done |
+| 8 | Raise the default timeout, with a ceiling no caller can pass | 4 | Done |
+| 9 | A default cache TTL for a plugin that declares none | 13 | Done |

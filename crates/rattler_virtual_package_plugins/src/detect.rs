@@ -4,24 +4,32 @@
 //! run it, read what it said, hold it to what its channel promised, and keep the
 //! answer so the next solve does not pay for it again.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use rattler_cache::{
     package_cache::PackageCache,
-    virtual_package_plugin_cache::{CacheKey, CachedDetection, VirtualPackagePluginCache},
+    virtual_package_plugin_cache::{
+        CacheKey, CachedDetection, VirtualPackagePluginCache, WatchList,
+    },
 };
 use rattler_conda_types::{Channel, ChannelVirtualPackage, PackageName, Platform};
 use rattler_repodata_gateway::Gateway;
 
 use crate::{
     contract::{self, ContractViolation},
-    environment::{EnvironmentError, PluginEnvironmentOptions, ensure_plugin_environment},
-    protocol::{ProtocolError, parse_output},
-    runner::{RunnerError, run_plugin},
+    environment::{
+        EnvironmentError, EnvironmentTimings, PluginEnvironmentOptions, ensure_plugin_environment,
+    },
+    protocol::{ProtocolError, parse_report},
+    runner::{RunOptions, RunTimeout, RunnerError, run_plugin},
 };
 
 /// What a detection produced, and whether it had to run the plugin to get it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Detection {
     /// The virtual packages the plugin reported present, each carrying the
     /// channel and the plugin environment that produced it.
@@ -29,6 +37,25 @@ pub struct Detection {
 
     /// Whether this came from the cache rather than from running the plugin.
     pub from_cache: bool,
+
+    /// How long each stage took.
+    pub timings: DetectionTimings,
+}
+
+/// How long each stage of one detection took.
+///
+/// Detection sits on the way into a solve, so what it costs matters. Which
+/// stage dominates decides what is worth doing about it, and that is not
+/// guessable: it depends on the channel, on whether the repodata is cached, and
+/// on whether the plugin has dependencies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DetectionTimings {
+    /// Preparing the plugin's environment: repodata, solve, install.
+    pub environment: EnvironmentTimings,
+
+    /// Running the plugin, including activating its prefix. Zero when the
+    /// verdicts came from the cache.
+    pub run: Duration,
 }
 
 /// Detection failed. Every variant means the same thing for a solve -- none of
@@ -60,7 +87,7 @@ pub enum DetectError {
         stderr: String,
     },
 
-    /// The plugin's output was not valid protocol.
+    /// The plugin's report could not be read.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 
@@ -72,6 +99,21 @@ pub enum DetectError {
     /// The result could not be cached.
     #[error(transparent)]
     Cache(#[from] rattler_cache::virtual_package_plugin_cache::CacheError),
+}
+
+impl DetectError {
+    /// What the plugin wrote to stderr, where a plugin ran at all.
+    ///
+    /// Kept out of the error message: it is the plugin's text, not this crate's,
+    /// and it can run to several lines. A caller reporting the failure decides
+    /// how to lay it out.
+    pub fn plugin_stderr(&self) -> Option<&str> {
+        match self {
+            Self::Runner(error) => error.plugin_stderr(),
+            Self::PluginFailed { stderr, .. } => Some(stderr),
+            Self::Environment(_) | Self::Protocol(_) | Self::Contract(_) | Self::Cache(_) => None,
+        }
+    }
 }
 
 /// Everything needed to detect one plugin's virtual packages.
@@ -101,6 +143,9 @@ pub struct DetectOptions<'a> {
     /// The platform to solve the plugin for; detection is host-only.
     pub host_platform: Platform,
 
+    /// How long the plugin may run before it is killed.
+    pub timeout: RunTimeout,
+
     /// The current time in seconds since the Unix epoch, used for cache expiry.
     /// A parameter rather than read from the clock so callers and tests agree on
     /// what "now" is across a whole solve.
@@ -123,6 +168,7 @@ pub async fn detect_virtual_packages(options: DetectOptions<'_>) -> Result<Detec
         declared,
         environment_root,
         host_platform,
+        timeout,
         now,
     } = options;
 
@@ -136,22 +182,31 @@ pub async fn detect_virtual_packages(options: DetectOptions<'_>) -> Result<Detec
     })
     .await?;
 
+    let mut timings = DetectionTimings {
+        environment: environment.timings,
+        run: Duration::ZERO,
+    };
+
     let key = CacheKey::new(channel.base_url.clone(), plugin.clone(), environment.sha256);
     if let Some(cached) = detection_cache.get(&key, now)? {
         tracing::debug!("reusing cached verdicts for {}", plugin.as_source());
         return Ok(Detection {
             virtual_packages: cached.virtual_packages,
             from_cache: true,
+            timings,
         });
     }
 
-    let run = run_plugin(
-        &environment.prefix,
-        plugin.as_source(),
-        host_platform,
-        declared.len(),
-    )
+    let started = Instant::now();
+    let run = run_plugin(RunOptions {
+        prefix: &environment.prefix,
+        entry_point: plugin.as_source(),
+        platform: host_platform,
+        declared_count: declared.len(),
+        timeout,
+    })
     .await?;
+    timings.run = started.elapsed();
     if !run.succeeded() {
         return Err(DetectError::PluginFailed {
             exit_code: run.exit_code,
@@ -166,28 +221,31 @@ pub async fn detect_virtual_packages(options: DetectOptions<'_>) -> Result<Detec
         );
     }
 
-    let output = parse_output(&run.stdout)?;
-    contract::validate(declared, &output)?;
+    let report = parse_report(&run.stdout)?;
+    contract::validate(declared, &report)?;
 
-    let virtual_packages: Vec<_> = output
-        .detections
-        .iter()
-        .filter_map(|verdict| {
-            Some(ChannelVirtualPackage {
-                channel: channel.base_url.clone(),
-                plugin_sha256: environment.sha256,
-                package: verdict.to_generic()?,
-            })
+    let virtual_packages: Vec<_> = report
+        .present()
+        .map(|package| ChannelVirtualPackage {
+            channel: channel.base_url.clone(),
+            plugin_sha256: environment.sha256,
+            package,
         })
         .collect();
 
     // Cached even when everything came back absent: "no such hardware here" is a
-    // real answer and just as expensive to compute again.
-    let policy = output.cache_policy.unwrap_or_default();
+    // real answer and just as expensive to compute again. A plugin that declared
+    // no policy still gets an expiry -- the one that thought least about caching
+    // must not be the one whose answers are kept longest.
+    let policy = report.cache.unwrap_or_default();
+    let watch = WatchList {
+        paths: policy.watch_paths.iter().map(Into::into).collect(),
+        env: policy.watch_env.clone(),
+    };
     let cached = CachedDetection::record(
         virtual_packages,
-        policy.ttl_seconds,
-        policy.watch_paths.iter().map(Into::into),
+        Some(policy.effective_ttl_seconds()),
+        &watch,
         now,
     );
     detection_cache.put(&key, &cached)?;
@@ -195,5 +253,6 @@ pub async fn detect_virtual_packages(options: DetectOptions<'_>) -> Result<Detec
     Ok(Detection {
         virtual_packages: cached.virtual_packages,
         from_cache: false,
+        timings,
     })
 }
