@@ -360,10 +360,31 @@ async fn detect_plugins(
     // One timestamp for the whole run, so every plugin agrees on what now is.
     let now = jiff::Timestamp::now().as_second();
 
-    // Collected across every channel before anything runs: which plugin speaks
-    // for a virtual package cannot be decided one channel at a time.
-    let mut registrations = Vec::new();
+    // One view per channel asked about: the channel plus everything it inherits
+    // through a `base` chain. Views are independent, so two unrelated channels
+    // each answer for their own names rather than one shadowing the other.
+    let mut views = Vec::new();
     for channel in &channels {
+        views.push(
+            channel_view(&gateway, channel, platform)
+                .await
+                .into_diagnostic()?,
+        );
+    }
+
+    // Every channel any view can see, not just the ones named on the command
+    // line: a view inherits its base channels' registrations, and a base is
+    // usually not something the user listed. Deduplicated, since views overlap
+    // wherever they share a base.
+    let mut in_scope: Vec<Channel> = Vec::new();
+    for url in views.iter().flat_map(|view| &view.chain) {
+        if !in_scope.iter().any(|channel| channel.base_url == *url) {
+            in_scope.push(Channel::from_url(url.clone()));
+        }
+    }
+
+    let mut registrations = Vec::new();
+    for channel in &in_scope {
         let plugins = gateway
             .virtual_package_plugins(channel, platform)
             .await
@@ -375,17 +396,6 @@ async fn detect_plugins(
                 plugins,
             });
         }
-    }
-    // One view per channel asked about: the channel plus everything it inherits
-    // through a `base` chain. Views are independent, so two unrelated channels
-    // each answer for their own names rather than one shadowing the other.
-    let mut views = Vec::new();
-    for channel in &channels {
-        views.push(
-            channel_view(&gateway, channel, platform)
-                .await
-                .into_diagnostic()?,
-        );
     }
     let resolved_views =
         resolve_views(&views, registrations).map_err(|err| miette::miette!(err))?;
@@ -418,10 +428,10 @@ async fn detect_plugins(
                 continue;
             }
 
-            let channel = channels
+            let channel = in_scope
                 .iter()
                 .find(|channel| channel.base_url == resolved.channel)
-                .expect("every resolved plugin came from one of these channels");
+                .expect("a resolved plugin comes from a channel some view can see");
             let detection = detect_virtual_packages(DetectOptions {
                 gateway: context.gateway,
                 package_cache: context.package_cache,
