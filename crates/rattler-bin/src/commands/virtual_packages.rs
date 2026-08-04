@@ -325,7 +325,7 @@ async fn detect_plugins(
     };
     use rattler_repodata_gateway::SubdirVirtualPackagePlugins;
     use rattler_virtual_package_plugins::{
-        BuiltinVirtualPackages, DetectOptions, PluginContext, VirtualPackageFactory,
+        BuiltinVirtualPackages, DetectOptions, PluginContext, VirtualPackageFactory, combine,
         detect_virtual_packages, resolve_views,
     };
 
@@ -432,24 +432,11 @@ async fn detect_plugins(
             console::style(format!("[{platform}]")).dim(),
         );
 
-        // A plugin in this view claiming a name the client also detects
-        // overrides it, so the built-in is only shown where nothing did.
-        let overridden: std::collections::BTreeSet<_> = view
-            .plugins
-            .iter()
-            .flat_map(|resolved| resolved.provides.iter().cloned())
-            .collect();
-        for detected in &built_in {
-            if overridden.contains(&detected.package.name) {
-                continue;
-            }
-            println!(
-                "  {} {} {}",
-                console::style(console::Emoji("•", "-")).dim(),
-                console::style(&detected.package).dim(),
-                console::style("(built in)").dim(),
-            );
-        }
+        // Collected as the plugins run, because which built-ins survive depends
+        // on what the plugins actually produced -- not on what they claimed. A
+        // plugin that claims `__archspec` and finds nothing must not take the
+        // built-in down with it.
+        let mut produced: Vec<rattler_conda_types::SourcedVirtualPackage> = Vec::new();
 
         for resolved in view.plugins.iter().chain(&view.shadowed) {
             if resolved.provides.is_empty() {
@@ -476,7 +463,16 @@ async fn detect_plugins(
             .await;
 
             match detection {
-                Ok(detection) => report_detection(resolved, &detection, show_timings),
+                Ok(detection) => {
+                    produced.extend(
+                        detection
+                            .virtual_packages
+                            .iter()
+                            .filter(|detected| resolved.provides.contains(&detected.package.name))
+                            .cloned(),
+                    );
+                    report_detection(resolved, &detection, show_timings);
+                }
                 Err(err) => {
                     println!(
                         "  {} {} {}",
@@ -494,6 +490,21 @@ async fn detect_plugins(
                     }
                 }
             }
+        }
+
+        // `combine` decides which built-ins a plugin actually replaced, which is
+        // also what keeps a name CEP 30 mandates from vanishing when a channel's
+        // plugin claims it and comes back empty.
+        for detected in combine(built_in.clone(), produced.clone())
+            .into_iter()
+            .filter(|detected| detected.source.is_built_in())
+        {
+            println!(
+                "  {} {} {}",
+                console::style(console::Emoji("•", "-")).dim(),
+                console::style(&detected.package).dim(),
+                console::style("(built in)").dim(),
+            );
         }
     }
 

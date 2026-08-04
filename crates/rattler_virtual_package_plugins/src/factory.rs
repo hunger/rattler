@@ -252,6 +252,45 @@ impl VirtualPackageFactory for PluginVirtualPackages<'_> {
     }
 }
 
+/// The virtual packages a view offers: everything its plugins found, plus the
+/// built-ins none of them replaced.
+///
+/// **A plugin may change what a name means; it may not make the name go away.**
+/// A built-in survives unless a plugin actually produced the same name, which is
+/// not the same as a plugin having *claimed* it. A plugin registered for
+/// `__archspec` that reports it absent has claimed the name and produced
+/// nothing, and dropping the built-in there would leave the set without a name
+/// CEP 30 says MUST always be present -- because a channel got its detection
+/// wrong.
+///
+/// The rule holds for every built-in rather than only the always-present ones.
+/// CEP 30 pins when each of its names must and must not appear (`__cuda` when
+/// there are NVIDIA drivers, `__linux` on Linux, and so on), so a client that
+/// detected one is already meeting the CEP; a plugin contradicting that is
+/// asserting something the CEP does not let it assert.
+pub fn combine(
+    built_in: Vec<SourcedVirtualPackage>,
+    from_plugins: Vec<SourcedVirtualPackage>,
+) -> Vec<SourcedVirtualPackage> {
+    let produced: BTreeSet<_> = from_plugins
+        .iter()
+        .map(|detected| detected.package.name.clone())
+        .collect();
+
+    let kept: Vec<_> = built_in
+        .into_iter()
+        .filter(|detected| !produced.contains(&detected.package.name))
+        .inspect(|detected| {
+            tracing::debug!(
+                "keeping the built-in {}: no plugin in this view produced it",
+                detected.package.name.as_source()
+            );
+        })
+        .collect();
+
+    from_plugins.into_iter().chain(kept).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use rattler_conda_types::Platform;
@@ -328,6 +367,59 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(names, expected);
+    }
+
+    /// A plugin that claims a CEP 30 name and then reports it absent must not
+    /// take the name down with it. CEP 30 requires `__archspec` to be present
+    /// on every system, and a channel getting its detection wrong is not a
+    /// reason for a client to stop complying.
+    #[tokio::test]
+    async fn a_plugin_cannot_delete_a_mandated_virtual_package() {
+        let built_in = BuiltinVirtualPackages::from_env().resolve().await.unwrap();
+        let archspec = PackageName::new_unchecked("__archspec");
+        assert!(
+            built_in
+                .iter()
+                .any(|detected| detected.package.name == archspec),
+            "CEP 30 requires __archspec of every system"
+        );
+
+        // The plugin claimed __archspec and found nothing, so it produced
+        // nothing: an empty result, not an entry saying absent.
+        let combined = combine(built_in, Vec::new());
+
+        assert!(
+            combined
+                .iter()
+                .any(|detected| detected.package.name == archspec),
+            "__archspec disappeared because a plugin claimed it and found nothing"
+        );
+    }
+
+    /// Overriding a built-in is still allowed -- that is the whole point of a
+    /// channel registering a plugin for a name the client also detects. What is
+    /// not allowed is removal.
+    #[tokio::test]
+    async fn a_plugin_may_replace_a_built_in_value() {
+        let built_in = BuiltinVirtualPackages::from_env().resolve().await.unwrap();
+        let archspec = PackageName::new_unchecked("__archspec");
+
+        let from_plugin = SourcedVirtualPackage {
+            source: VirtualPackageSource::BuiltIn,
+            package: rattler_conda_types::GenericVirtualPackage {
+                name: archspec.clone(),
+                version: "1".parse().unwrap(),
+                build_string: "from-a-plugin".to_string(),
+            },
+        };
+        let combined = combine(built_in, vec![from_plugin]);
+
+        let found: Vec<_> = combined
+            .iter()
+            .filter(|detected| detected.package.name == archspec)
+            .collect();
+        assert_eq!(found.len(), 1, "the name must not be reported twice");
+        assert_eq!(found[0].package.build_string, "from-a-plugin");
     }
 
     /// The hand-written list has to keep up with what detection actually

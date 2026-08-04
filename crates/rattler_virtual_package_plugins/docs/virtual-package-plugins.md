@@ -75,6 +75,15 @@ because more than one of them overturned a choice made before it was read.
 | [38](../../../../ceps/cep-0038.md) Channel-wide metadata | Accepted | Considered for the registration, rejected |
 | [16](../../../../ceps/cep-0016.md) Sharded repodata | Accepted | The second place the registration is published |
 
+**CEP 30 -- a plugin may replace a name, never remove it.** `combine` merges a view's plugin
+results with the built-ins, and a built-in survives unless a plugin *produced* the same name --
+which is not the same as a plugin having *claimed* it. A plugin registered for `__archspec` that
+finds nothing has claimed the name and produced nothing, and dropping the built-in there would leave
+the set without a name the CEP says MUST always be present, because a channel got its detection
+wrong. The rule covers every built-in rather than only the always-present ones: CEP 30 pins when
+each of its names must and must not appear, so a client that detected one is already meeting the
+CEP, and a plugin contradicting that is asserting something the CEP does not let it assert.
+
 **CEP 30 -- the built-ins belong to the client, not to a channel.** It requires every client to
 support `__archspec`, `__cuda`, `__glibc`, `__linux`, `__osx`, `__unix` and `__win`, with
 `__archspec` present *always* and `__linux`/`__unix` on matching platforms, and it names rattler as
@@ -782,18 +791,20 @@ answer was cached or freshly produced:
 
 ```
 🔌 file:///.../virtual-package-plugins/ [linux-64]
-  • __unix=0=0 (built in)
-  • __linux=7.0.11=0 (built in)
-  • __glibc=2.43=0 (built in)
-  • __archspec=1=zen5 (built in)
   ✔ foobar-detect (from cache)
       __foobar=1.2.3
       __foobar_arch=0=gen4
   ✖ rocm-detect (skipped)
       the channel registers the plugin 'rocm-detect' but provides no such package
+  • __unix=0=0 (built in)
+  • __linux=7.0.11=0 (built in)
+  • __glibc=2.43=0 (built in)
+  • __archspec=1=zen5 (built in)
 ```
 
-Each view reports its whole set, built-ins included, because that is what a view *is* -- the virtual
+The built-ins come last because which of them survive is only known once the plugins have run: a
+plugin that *claimed* a name but found nothing has not replaced it. Each view reports its whole set,
+built-ins included, because that is what a view *is* -- the virtual
 packages a solve against that channel would see. The built-ins come from `BuiltinVirtualPackages`,
 resolved once for the run since they do not vary by channel and detecting them can mean a driver
 query. A built-in whose name a plugin in that view claims is not printed: the plugin overrode it.
