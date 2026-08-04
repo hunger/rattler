@@ -5604,6 +5604,7 @@ dependencies = [
  "rattler_shell",
  "rattler_solve",
  "rattler_virtual_packages",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

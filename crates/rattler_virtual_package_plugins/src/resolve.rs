@@ -31,6 +31,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
+    sync::LazyLock,
 };
 
 use indexmap::IndexMap;
@@ -39,6 +40,7 @@ use rattler_repodata_gateway::{
     DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH, Gateway, GatewayError, SubdirVirtualPackagePlugins,
     resolve_channel_relation,
 };
+use regex::Regex;
 
 /// What one channel registered, once its subdirs have been folded together.
 type ChannelPlugins = IndexMap<PackageName, BTreeSet<PackageName>>;
@@ -420,6 +422,31 @@ fn check_for_self_conflict(
     Ok(())
 }
 
+/// Whether `name` is a virtual package name CEP 26 allows.
+///
+/// The pattern is the CEP's own, quoted rather than reimplemented: getting a
+/// character class subtly wrong here would either reject legitimate names or
+/// admit ones the rest of the ecosystem will refuse.
+///
+/// Registrations reach this from channel metadata, so they are parsed leniently
+/// -- one malformed entry must not make a whole `repodata.json` unusable -- but
+/// parsing leniently is not the same as acting on the result. A name the CEP
+/// forbids is dropped here rather than carried into a view, where it would fail
+/// later as an unusable package spec.
+fn is_valid_virtual_package_name(name: &PackageName) -> bool {
+    /// CEP 26: "Virtual package names MUST follow this regex."
+    static VALID: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$")
+            .expect("the pattern is a literal from CEP 26")
+    });
+    /// CEP 26: "the maximum length of a package name MUST NOT exceed 64
+    /// characters."
+    const MAX_LENGTH: usize = 64;
+
+    let name = name.as_normalized();
+    name.len() <= MAX_LENGTH && VALID.is_match(name)
+}
+
 /// One entry per channel, in the order the channels first appear, each mapping
 /// a plugin to everything that channel's subdirs registered it for.
 fn fold_subdirs(
@@ -428,9 +455,22 @@ fn fold_subdirs(
     let mut channels: IndexMap<ChannelUrl, ChannelPlugins> = IndexMap::new();
 
     for subdir in registrations {
+        let channel = subdir.channel.clone();
         let plugins = channels.entry(subdir.channel).or_default();
         for (plugin, declared) in subdir.plugins {
-            plugins.entry(plugin).or_default().extend(declared);
+            let (valid, rejected): (Vec<_>, Vec<_>) = declared
+                .into_iter()
+                .partition(is_valid_virtual_package_name);
+            for name in rejected {
+                tracing::warn!(
+                    "ignoring '{}', which '{}' registers '{}' for: CEP 26 does not allow it as a \
+                     virtual package name",
+                    name.as_source(),
+                    channel,
+                    plugin.as_source()
+                );
+            }
+            plugins.entry(plugin).or_default().extend(valid);
         }
     }
 
@@ -919,6 +959,55 @@ mod tests {
         .expect("a reference that does not resolve is skipped");
 
         assert_eq!(chain, [channel("mine")]);
+    }
+
+    /// CEP 26 says what a virtual package may be called. A registration naming
+    /// something else is dropped rather than carried into a view, where it would
+    /// fail later as an unusable package spec.
+    #[test]
+    fn a_name_cep_26_forbids_is_not_resolved() {
+        let resolved = resolve_views(
+            &[view(&["org"])],
+            [subdir(
+                "org",
+                Platform::Linux64,
+                &[("d-detect", &["__rocm", "no-underscores", "__UPPER", "__"])],
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            provides(&resolved[0].plugins[0]),
+            ["__rocm"],
+            "only the legal name survives"
+        );
+    }
+
+    /// A registration whose names are all illegal provides nothing, so the
+    /// plugin is not run at all -- but the channel is otherwise unaffected.
+    #[test]
+    fn one_bad_name_does_not_spoil_a_channel() {
+        let resolved = resolve_views(
+            &[view(&["org"])],
+            [subdir(
+                "org",
+                Platform::Linux64,
+                &[("bad-detect", &["nonsense"]), ("good-detect", &["__rocm"])],
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].plugins.len(), 1);
+        assert_eq!(resolved[0].plugins[0].plugin.as_source(), "good-detect");
+    }
+
+    /// CEP 26 caps a package name at 64 characters.
+    #[test]
+    fn an_overlong_name_is_rejected() {
+        let long = format!("__{}", "a".repeat(63));
+        assert_eq!(long.len(), 65);
+        assert!(!is_valid_virtual_package_name(&name(&long)));
+        assert!(is_valid_virtual_package_name(&name(&long[..64])));
     }
 
     #[test]

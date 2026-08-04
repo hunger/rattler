@@ -130,10 +130,18 @@ the contradiction have no other coverage, and the cycle *algorithm* was already 
 `topological_order` while the wiring that turns `None` into `ViewError::Cycle` was not.
 
 **CEP 26 -- what a virtual package may be called.** Names must match
-`^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$` and stay under 64 characters. Registrations are still
-parsed leniently, so one malformed name cannot make a whole `repodata.json` unusable -- but that is
-a parsing decision, not a licence: a name that does not meet CEP 26 will fail later, when it is used
-as a package spec. Validating at parse time is the open item here.
+`^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$` and stay under 64 characters, and a registration naming
+anything else is now dropped when the view is built, with a warning naming the channel and plugin.
+
+Parsing stays lenient, which is a different question: a malformed name must not make a whole
+`repodata.json` unusable, so it survives deserialization and is discarded when something would
+otherwise act on it. `PackageName` is no help here -- it validates the character set and nothing
+about the `__` prefix, the separator rules or the length -- so the check quotes the CEP's pattern
+literally rather than reimplementing it, because a subtly wrong character class would either reject
+legitimate names or admit ones the rest of the ecosystem refuses.
+
+Dropping the name rather than the whole registration is deliberate: a plugin registered for one
+legal and one illegal name is still run, and still held to the legal one.
 
 **CEP 33 -- versions compare the conda way.** CEP 30 requires a virtual package's version to follow
 CEP 33 whatever produced it, so a plugin's version string goes through the same `Version` type as
@@ -234,11 +242,11 @@ Consumers see one entry per subdir and may union them. A channel-wide location w
 needs a CEP: CEP 38's `channeldata.json` is the only channel-wide file that exists and does not fit
 (see *What the CEPs Decide*).
 
-**Lenient parsing.** Plugin and virtual package names are parsed without validation, so a channel
-publishing a malformed name does not make the whole `repodata.json` unusable. CEP 26 does constrain
-what a virtual package may be called -- `^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$`, under 64
-characters -- and a name that breaks it fails later, when it is used as a package spec, rather than
-at parse time.
+**Lenient parsing, strict use.** Plugin and virtual package names are parsed without validation, so
+a channel publishing a malformed name does not make the whole `repodata.json` unusable. CEP 26 does
+constrain what a virtual package may be called -- `^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$`, under
+64 characters -- and a name breaking it is dropped when the view is built, with a warning, rather
+than carried into a solve.
 
 ### 2. Client-Side: Plugin Execution and Caching
 
