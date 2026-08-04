@@ -59,6 +59,73 @@ for every build in the workspace.
 `info.virtual_package_plugins` on a repodata round-trip, and with the feature on it writes an empty
 map. Only a channel server publishing the field directly exercises the path today.
 
+### What the CEPs Decide
+
+Several accepted CEPs constrain this design. They are listed here with the decision each forced,
+because more than one of them overturned a choice made before it was read.
+
+| CEP | Status | Bears on |
+| --- | --- | --- |
+| [30](../../../../ceps/cep-0030.md) Virtual packages | Accepted | Which virtual packages exist and who owes them |
+| [46](../../../../ceps/cep-0046.md) `__cuda_arch` | Accepted | Where a virtual package's information lives |
+| [42](../../../../ceps/cep-0042.md) Channel relations | Accepted | Which channels a view spans, and who outranks whom |
+| [26](../../../../ceps/cep-0026.md) Identifying packages and channels | Approved | Legal virtual package names |
+| [33](../../../../ceps/cep-0033.md) Version literals and ordering | Accepted | Version comparison for `__rocm >=6.0` |
+| [36](../../../../ceps/cep-0036.md) Package metadata files | Accepted | Whether the registration may live in `info` |
+| [38](../../../../ceps/cep-0038.md) Channel-wide metadata | Accepted | Considered for the registration, rejected |
+| [16](../../../../ceps/cep-0016.md) Sharded repodata | Accepted | The second place the registration is published |
+
+**CEP 30 -- the built-ins belong to the client, not to a channel.** It requires every client to
+support `__archspec`, `__cuda`, `__glibc`, `__linux`, `__osx`, `__unix` and `__win`, with
+`__archspec` present *always* and `__linux`/`__unix` on matching platforms, and it names rattler as
+a reference implementation. So the built-ins carry a `BuiltIn` source with no channel, are visible
+in every view, and are never made conditional on which channels are configured. An earlier draft
+attributed them to conda-forge and dropped them when conda-forge was absent; that would have broken
+compliance outright. What the CEP does *not* say is that the client's own detection must be what
+fills a name, which is why a plugin may still override one.
+
+**CEP 46 -- the build string is not a place to put identity.** `__cuda_arch` puts the compute
+capability in the *version* and requires its build string to be `0`; using the build string for the
+device name was explicitly rejected so that nobody constrains on it. `build_string` in the report
+protocol therefore exists for `__archspec`, which CEP 30 does require to carry a microarchitecture
+there, and not as a general side channel. The examples in this document were wrong on this point
+until the CEP was read.
+
+**CEP 42 -- what a view spans, and which side wins.** Two relations, `base` and `overrides`, both
+of which pull a channel into scope whether or not the user listed it, and whose directions are
+opposite: a `base` is *higher* priority than the channel declaring it, a channel is *higher* than
+what it `overrides`. Resolution follows both, in that order. An earlier attempt followed only `base`
+and had its direction reversed, which let a channel that declared itself built upon another
+contradict that other's account of the system it was built for.
+
+**CEP 26 -- what a virtual package may be called.** Names must match
+`^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$` and stay under 64 characters. Registrations are still
+parsed leniently, so one malformed name cannot make a whole `repodata.json` unusable -- but that is
+a parsing decision, not a licence: a name that does not meet CEP 26 will fail later, when it is used
+as a package spec. Validating at parse time is the open item here.
+
+**CEP 33 -- versions compare the conda way.** CEP 30 requires a virtual package's version to follow
+CEP 33 whatever produced it, so a plugin's version string goes through the same `Version` type as
+any package's, and `__rocm >=6.0,<7` orders as expected. Nothing special was needed; this is why
+`Detected::version` is a `Version` and not a string.
+
+**CEP 36 and 38 -- where the registration lives.** CEP 36 describes the `repodata.json` schema and
+says of the `info` dictionary that "additional keys SHOULD NOT be present and SHOULD be ignored",
+while *top-level* additional keys "MUST be allowed" and ignored when unrecognised. So
+`info.virtual_package_plugins` is an extension CEP 36 discourages, and legitimising it needs a CEP
+of its own -- exactly the path CEP 42 took to put `channel_relations` in the same dictionary. That
+precedent is why `info` was chosen anyway: it is where channel-level metadata now lives, and older
+clients ignore what they do not recognise.
+
+CEP 38's `channeldata.json` was considered as the channel-wide home that would end the per-subdir
+duplication, and does not fit. Its schema is an aggregation of *per-package* metadata with fixed
+required keys, it is optional and documented as potentially unreliable, and reading it costs an
+extra HTTP request -- which is the very thing CEP 42 gives as its reason for choosing `repodata.json`
+instead. The channel-wide location this design wants does not exist yet.
+
+**CEP 16 -- sharded channels.** The sharded index carries an `info` dictionary too, so the
+registration is published there as well and a sharded channel is not a second-class citizen.
+
 ### Problem
 
 Today, virtual packages like `__cuda` are hardcoded in the solver client. This made sense when NVIDIA
@@ -133,10 +200,14 @@ The same field is published in the sharded repodata index (`repodata_shards.msgp
 **Per-subdir, not channel-wide.** `info` lives in each subdir's repodata, so the registration must be
 repeated in every subdir of a channel, and different subdirs *may* declare different registrations.
 Consumers see one entry per subdir and may union them. A channel-wide location would be better and
-needs a CEP.
+needs a CEP: CEP 38's `channeldata.json` is the only channel-wide file that exists and does not fit
+(see *What the CEPs Decide*).
 
 **Lenient parsing.** Plugin and virtual package names are parsed without validation, so a channel
-publishing a malformed name does not make the whole `repodata.json` unusable.
+publishing a malformed name does not make the whole `repodata.json` unusable. CEP 26 does constrain
+what a virtual package may be called -- `^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$`, under 64
+characters -- and a name that breaks it fails later, when it is used as a package spec, rather than
+at parse time.
 
 ### 2. Client-Side: Plugin Execution and Caching
 
@@ -283,7 +354,7 @@ in the environment's binary directory so no path needs declaring either.
 {
   "virtual_packages": {
     "__cuda": { "version": "12.4" },
-    "__cuda_arch": { "version": "0", "build_string": "sm_89" },
+    "__cuda_arch": { "version": "8.9" },
     "__rocm": null
   },
   "cache": {
@@ -298,8 +369,11 @@ in the environment's binary directory so no path needs declaring either.
 package its channel registered it for, so absence has to be something it can state -- and keying by
 name is what lets a `null` carry it: the contract checks which *keys* are present, so a missing key
 is silence and an explicit `null` is a verdict, with no deserializer subtlety in between.
-`build_string` is optional and exists because `__archspec` and `__cuda_arch` carry their information
-there rather than in the version.
+`build_string` is optional and exists because `__archspec` carries its information there rather than
+in the version: CEP 30 requires its build string to name a CPU microarchitecture, with the version
+fixed at `1`. It is *not* how `__cuda_arch` works -- CEP 46 requires that one's build string to be
+`0` and puts the compute capability in the version, having explicitly rejected using the build
+string for device identity so that nobody constrains on it.
 
 Keying by name also makes a duplicate verdict impossible to write down, and an object cannot repeat
 its `cache` key, so neither needs detecting.
@@ -764,10 +838,13 @@ once and reports both the driver version and the compute capability:
 {
   "virtual_packages": {
     "__cuda": { "version": "12.4" },
-    "__cuda_arch": { "version": "0", "build_string": "sm_89" }
+    "__cuda_arch": { "version": "8.9" }
   }
 }
 ```
+
+(Both as their CEPs require: `__cuda` the driver's CUDA version, `__cuda_arch` the compute
+capability in the *version*, with no build string.)
 
 On a machine with no NVIDIA driver the same plugin exits 0 and reports both as `null` -- it still has
 to account for every name it was registered for. Under the draft's original
@@ -840,7 +917,9 @@ the arrangement that motivated grouping in the first place: one driver connectio
    in the lock file, and when plugins are updated. Current leaning: always use the latest available and
    do not lock it, but this is unresolved.
 6. **Channel-wide storage.** `info` is per-subdir, so the registration is duplicated across subdirs.
-   A channel-wide metadata location would fix this and needs a CEP.
+   A channel-wide location would fix it, and none suitable exists: CEP 38's `channeldata.json`
+   aggregates per-package metadata, is optional, is documented as unreliable, and costs an extra
+   request. This needs a CEP, which would also legitimise the `info` key under CEP 36.
 7. **Channel relations and overriding.** Whether a channel may register a plugin for a virtual package
    its base channel already covers (e.g. a private channel overriding `__glibc`), and whether such an
    override should affect the base channel. Shadowing along the `base` chain is now detected and
@@ -850,8 +929,9 @@ the arrangement that motivated grouping in the first place: one driver connectio
    library to query a driver API, those deps are resolved from the same channel. Solving the plugin
    environment with built-in virtual packages only (see above) breaks the bootstrap recursion; the
    remaining risk is ordinary dependency conflict.
-9. **Versioning semantics.** Virtual package versions should follow conda version ordering so that
-   constraints like `__rocm >= 6.0, < 7` work as expected.
+9. ~~**Versioning semantics.**~~ Settled by CEP 33 via CEP 30: a virtual package's version follows
+   conda version ordering whatever produced it, so `__rocm >=6.0,<7` works because the value goes
+   through the same `Version` type as any package's.
 10. **wheelnext.** Worth looking at closely -- they are solving essentially the same problem.
 11. **Concurrent detections.** Nothing serializes two processes preparing the same plugin
     environment: the sentinel keeps a half-installed prefix from being *used*, not two installers
@@ -885,7 +965,7 @@ duplicate verdict impossible to express rather than something the contract has t
 {
   "virtual_packages": {
     "__cuda": { "version": "12.4" },
-    "__cuda_arch": { "version": "0", "build_string": "sm_89" },
+    "__cuda_arch": { "version": "8.9" },
     "__rocm": null
   },
   "cache": { "ttl_seconds": 86400, "watch_paths": ["/sys/module/amdgpu/version"] }

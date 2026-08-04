@@ -85,7 +85,11 @@ pub struct Detected {
     pub version: Version,
 
     /// The build string, for virtual packages that carry their information
-    /// there rather than in the version, such as `__archspec`.
+    /// there rather than in the version. `__archspec` is the case CEP 30
+    /// requires it for; `__cuda_arch` is *not* one, despite the name -- CEP 46
+    /// puts its compute capability in the version and fixes its build string at
+    /// `0`, having rejected using the build string for device identity so that
+    /// nobody writes a constraint against it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_string: Option<String>,
 }
