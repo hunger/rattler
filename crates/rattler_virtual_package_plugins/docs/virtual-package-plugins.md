@@ -22,7 +22,7 @@ beyond the feature flag itself.
 | Contract check of output against the registration | Implemented |
 | `SourcedVirtualPackage` result type, carrying a `BuiltIn` or `Plugin` source | Implemented |
 | `rattler virtual-packages -c <channel> [--detect]` | Implemented |
-| Resolution per view (channel + its CEP-42 relations) | Implemented -- `base` and `overrides` both in scope, CEP-42 priority decides |
+| Resolution per view (channel + its CEP-42 relations) | Implemented -- CEP-42's relation graph, topologically sorted; cycles, depth and contradictions are errors |
 | Running a plugin out of an existing environment, activated | Implemented |
 | Detection result cache | Implemented |
 | Plugin environment creation | Implemented |
@@ -94,9 +94,31 @@ until the CEP was read.
 **CEP 42 -- what a view spans, and which side wins.** Two relations, `base` and `overrides`, both
 of which pull a channel into scope whether or not the user listed it, and whose directions are
 opposite: a `base` is *higher* priority than the channel declaring it, a channel is *higher* than
-what it `overrides`. Resolution follows both, in that order. An earlier attempt followed only `base`
-and had its direction reversed, which let a channel that declared itself built upon another
-contradict that other's account of the system it was built for.
+what it `overrides`. An earlier attempt followed only `base` and had its direction reversed, which
+let a channel that declared itself built upon another contradict that other's account of the system
+it was built for.
+
+The CEP's algorithm is implemented, not approximated: relations form a directed graph of priority
+edges, and the chain is a topological sort of it. That matters beyond tidiness. Relations compose in
+ways a linear walk cannot see -- a channel's base may itself override something, and that something
+belongs in the order -- and three of the CEP's requirements only become checkable once the graph
+exists:
+
+- a **cycle** MUST be an error, and is `ViewError::Cycle`. A walk that stops at a channel it has
+  already visited cannot tell a cycle from a diamond; the sort can.
+- exceeding the **depth limit** SHOULD be an error, and is `ViewError::TooDeep`.
+- declaring **both `base` and `overrides` for the same channel** MUST be an error, and is
+  `ViewError::ContradictoryRelations` -- the channel has asked to be both above and below another.
+
+All three previously stopped the walk silently and carried on with whatever had been collected.
+
+Because these are the CEP's "MUST"s, each is tested rather than merely written. The graph walk is
+`relation_chain`, split from `channel_view` so it takes a lookup from channel to relations instead of
+a gateway: the crafted metadata that produces a cycle, a contradiction, or a chain past the depth cap
+is then a table in a test rather than a set of fixture channels that would have to be served. Each
+check was also verified by breaking it and confirming the matching test fails -- the depth cap and
+the contradiction have no other coverage, and the cycle *algorithm* was already tested through
+`topological_order` while the wiring that turns `None` into `ViewError::Cycle` was not.
 
 **CEP 26 -- what a virtual package may be called.** Names must match
 `^__[a-z0-9][._-]?([a-z0-9]+(\.|-|_|$))*$` and stay under 64 characters. Registrations are still

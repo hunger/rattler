@@ -28,10 +28,13 @@
 //! also detects overrides it. CEP 30 requires such a name to be *present* and
 //! does not dictate that the client's own detection is what fills it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    future::Future,
+};
 
 use indexmap::IndexMap;
-use rattler_conda_types::{Channel, ChannelUrl, PackageName, Platform};
+use rattler_conda_types::{Channel, ChannelRelations, ChannelUrl, PackageName, Platform};
 use rattler_repodata_gateway::{
     DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH, Gateway, GatewayError, SubdirVirtualPackagePlugins,
     resolve_channel_relation,
@@ -55,97 +58,205 @@ pub struct ChannelView {
     pub chain: Vec<ChannelUrl>,
 }
 
+/// Building a view ran into something CEP-42 says a client must refuse.
+#[derive(Debug, thiserror::Error)]
+pub enum ViewError {
+    /// The channel's repodata could not be read.
+    #[error(transparent)]
+    Gateway(#[from] GatewayError),
+
+    /// CEP-42: "A channel MUST NOT declare both `base` and `overrides`
+    /// referencing the same channel; clients MUST treat this as an error."
+    ///
+    /// The two say opposite things about priority, so a channel naming one
+    /// channel in both has asked to be above and below it at once.
+    #[error(
+        "the channel '{channel}' declares '{reference}' as both its base and a channel it \
+         overrides, which cannot both be true"
+    )]
+    ContradictoryRelations {
+        /// The channel that declared both.
+        channel: ChannelUrl,
+        /// The channel named twice.
+        reference: ChannelUrl,
+    },
+
+    /// CEP-42: "Clients MUST detect cycles in this graph and abort resolution
+    /// with an error when a cycle is detected."
+    #[error(
+        "the channel relations reachable from '{channel}' form a cycle, so no priority order \
+         exists for them"
+    )]
+    Cycle {
+        /// The channel the view was being built for.
+        channel: ChannelUrl,
+    },
+
+    /// CEP-42: "If the depth limit is exceeded, the client SHOULD abort
+    /// resolution with an error."
+    #[error(
+        "following the channel relations of '{channel}' went deeper than {limit} channels, which \
+         is as far as CEP-42 allows"
+    )]
+    TooDeep {
+        /// The channel the view was being built for.
+        channel: ChannelUrl,
+        /// The cap that was exceeded.
+        limit: usize,
+    },
+}
+
 /// The channels in scope for `channel`, in CEP-42 priority order.
 ///
-/// Both relations are followed, and their directions are the CEP's:
+/// This is CEP-42's own algorithm, restricted to what one channel can reach.
+/// Every channel reachable through a relation is discovered, each relation
+/// contributes a priority edge, and the result is a topological sort of that
+/// graph:
 ///
-/// - **`base`** names a channel the declaring one builds upon, which has
-///   *higher* priority. Bases are walked transitively and end up ahead of the
-///   declaring channel.
-/// - **`overrides`** names a channel the declaring one supersedes, which has
-///   *lower* priority. Overridden channels are walked transitively and end up
-///   behind it.
+/// - **`base`** names a channel the declaring one builds upon, giving an edge
+///   *from the base to the declaring channel*: the base has higher priority.
+/// - **`overrides`** names a channel the declaring one supersedes, giving an
+///   edge *from the declaring channel to the overridden one*: the declaring
+///   channel has higher priority.
 ///
 /// So a channel declaring `base: conda-forge` and `overrides: my-hotfixes`
-/// yields `[conda-forge, itself, my-hotfixes]`, which is the order CEP-42 spells
-/// out. A channel that wants to redefine a virtual package its upstream already
-/// speaks for declares `overrides`, not `base`: `base` means the upstream wins.
+/// yields `[conda-forge, itself, my-hotfixes]`. A channel that wants to redefine
+/// a virtual package its upstream already speaks for declares `overrides`, not
+/// `base`: `base` means the upstream wins.
+///
+/// A graph rather than two walks because relations compose in ways a walk
+/// cannot see: a channel's base may itself override something, and that
+/// something belongs in the order too. It is also what makes the cycle the CEP
+/// requires clients to reject detectable at all.
 ///
 /// References resolve through [`resolve_channel_relation`], so a reference the
-/// gateway would refuse is skipped here too, and one already in the chain ends
-/// that walk, which terminates a cycle. The depth cap is CEP-42's own
-/// [`DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH`].
+/// gateway would refuse is ignored here too.
 pub async fn channel_view(
     gateway: &Gateway,
     channel: &Channel,
     platform: Platform,
-) -> Result<ChannelView, GatewayError> {
-    let mut seen = BTreeSet::from([channel.base_url.clone()]);
-    let higher = walk(gateway, channel, platform, &mut seen, Relation::Base).await?;
-    let lower = walk(gateway, channel, platform, &mut seen, Relation::Overrides).await?;
-
-    // Bases are higher priority than the channel that declares them, so they
-    // come first, nearest last; overridden channels are lower, so they follow.
-    let chain = higher
-        .into_iter()
-        .rev()
-        .chain([channel.base_url.clone()])
-        .chain(lower)
-        .collect();
+) -> Result<ChannelView, ViewError> {
+    let root = channel.base_url.clone();
+    let chain = relation_chain(root.clone(), |current| async move {
+        gateway
+            .channel_relations(&Channel::from_url(current), platform)
+            .await
+    })
+    .await?;
 
     Ok(ChannelView {
-        channel: channel.base_url.clone(),
         chain,
+        channel: root,
     })
 }
 
-/// Which CEP-42 edge to follow.
-#[derive(Clone, Copy)]
-enum Relation {
-    /// Higher priority than the channel declaring it.
-    Base,
-    /// Lower priority than the channel declaring it.
-    Overrides,
-}
+/// The priority order of `root` and every channel reachable from it, following
+/// `relations_of` from one channel to the next.
+///
+/// Split from [`channel_view`] so the rules CEP-42 lays on the graph -- the
+/// depth cap, the contradiction, and the cycle it requires clients to reject --
+/// can be exercised without standing up a gateway that serves repodata declaring
+/// each of them.
+async fn relation_chain<Lookup, Fetch>(
+    root: ChannelUrl,
+    relations_of: Lookup,
+) -> Result<Vec<ChannelUrl>, ViewError>
+where
+    Lookup: Fn(ChannelUrl) -> Fetch,
+    Fetch: Future<Output = Result<Option<ChannelRelations>, GatewayError>>,
+{
+    let mut nodes: Vec<ChannelUrl> = vec![root.clone()];
+    let mut edges: Vec<(ChannelUrl, ChannelUrl)> = Vec::new();
+    let mut visited: BTreeSet<ChannelUrl> = BTreeSet::new();
+    let mut queue: VecDeque<(ChannelUrl, usize)> = VecDeque::from([(root.clone(), 0)]);
 
-/// Follows one relation transitively, nearest first.
-async fn walk(
-    gateway: &Gateway,
-    from: &Channel,
-    platform: Platform,
-    seen: &mut BTreeSet<ChannelUrl>,
-    relation: Relation,
-) -> Result<Vec<ChannelUrl>, GatewayError> {
-    let mut found: Vec<ChannelUrl> = Vec::new();
-
-    while found.len() <= DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH {
-        let declaring = found
-            .last()
-            .cloned()
-            .unwrap_or_else(|| from.base_url.clone());
-        let Some(relations) = gateway
-            .channel_relations(&Channel::from_url(declaring.clone()), platform)
-            .await?
-        else {
-            break;
-        };
-        let reference = match relation {
-            Relation::Base => relations.base,
-            Relation::Overrides => relations.overrides,
-        };
-        let Some(next) = reference
-            .as_deref()
-            .and_then(|reference| resolve_channel_relation(&declaring, reference))
-        else {
-            break;
-        };
-        if !seen.insert(next.clone()) {
-            break;
+    while let Some((current, depth)) = queue.pop_front() {
+        if !visited.insert(current.clone()) {
+            continue;
         }
-        found.push(next);
+        if depth > DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH {
+            return Err(ViewError::TooDeep {
+                channel: root,
+                limit: DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH,
+            });
+        }
+
+        let Some(relations) = relations_of(current.clone()).await? else {
+            continue;
+        };
+        let resolve = |reference: Option<String>| {
+            reference
+                .as_deref()
+                .and_then(|reference| resolve_channel_relation(&current, reference))
+        };
+        let base = resolve(relations.base);
+        let overrides = resolve(relations.overrides);
+
+        if let (Some(base), Some(overrides)) = (&base, &overrides)
+            && base == overrides
+        {
+            return Err(ViewError::ContradictoryRelations {
+                channel: current.clone(),
+                reference: base.clone(),
+            });
+        }
+
+        // A base outranks the channel naming it; a channel outranks what it
+        // overrides. Both directions are the CEP's.
+        for (higher, lower, next) in [
+            base.map(|base| (base.clone(), current.clone(), base)),
+            overrides.map(|overridden| (current.clone(), overridden.clone(), overridden)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            edges.push((higher, lower));
+            if !nodes.contains(&next) {
+                nodes.push(next.clone());
+            }
+            queue.push_back((next, depth + 1));
+        }
     }
 
-    Ok(found)
+    topological_order(&nodes, &edges).ok_or(ViewError::Cycle { channel: root })
+}
+
+/// Orders `nodes` so that every `(higher, lower)` edge puts `higher` first, or
+/// `None` if the edges contain a cycle.
+///
+/// Kahn's algorithm, taking ready nodes in discovery order so that a graph with
+/// several valid orders always produces the same one -- which channels get
+/// visited is metadata-driven, and a solve that shuffles between runs would be
+/// worse than one that is merely wrong.
+fn topological_order(
+    nodes: &[ChannelUrl],
+    edges: &[(ChannelUrl, ChannelUrl)],
+) -> Option<Vec<ChannelUrl>> {
+    let mut incoming: BTreeMap<&ChannelUrl, usize> =
+        nodes.iter().map(|node| (node, 0usize)).collect();
+    for (_, lower) in edges {
+        *incoming.entry(lower).or_default() += 1;
+    }
+
+    let mut ordered = Vec::with_capacity(nodes.len());
+    let mut ready: VecDeque<&ChannelUrl> = nodes
+        .iter()
+        .filter(|node| incoming.get(node).copied().unwrap_or_default() == 0)
+        .collect();
+
+    while let Some(node) = ready.pop_front() {
+        ordered.push(node.clone());
+        for (higher, lower) in edges.iter().filter(|(higher, _)| higher == node) {
+            let _ = higher;
+            let count = incoming.entry(lower).or_default();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                ready.push_back(lower);
+            }
+        }
+    }
+
+    (ordered.len() == nodes.len()).then_some(ordered)
 }
 
 /// What a channel registered, and how much of it survived the contest.
@@ -563,6 +674,251 @@ mod tests {
         assert_eq!(error.virtual_package, name("__rocm"));
         assert_eq!(error.first, name("a-detect"));
         assert_eq!(error.second, name("b-detect"));
+    }
+
+    /// CEP-42 requires a client to reject a relation cycle rather than pick an
+    /// arbitrary order, and a cycle is only visible once the relations are a
+    /// graph: a walk that stops at a channel it has already seen cannot tell a
+    /// cycle from a diamond.
+    #[test]
+    fn a_cycle_has_no_order() {
+        let a = channel("a");
+        let b = channel("b");
+        assert_eq!(
+            topological_order(&[a.clone(), b.clone()], &[(a.clone(), b.clone()), (b, a)]),
+            None
+        );
+    }
+
+    /// A diamond is not a cycle: two paths reaching the same channel still
+    /// admit an order, and refusing it would reject a legitimate arrangement.
+    #[test]
+    fn a_diamond_still_has_an_order() {
+        let (top, left, right, bottom) = (
+            channel("top"),
+            channel("left"),
+            channel("right"),
+            channel("bottom"),
+        );
+        let ordered = topological_order(
+            &[top.clone(), left.clone(), right.clone(), bottom.clone()],
+            &[
+                (top.clone(), left.clone()),
+                (top.clone(), right.clone()),
+                (left.clone(), bottom.clone()),
+                (right.clone(), bottom.clone()),
+            ],
+        )
+        .expect("a diamond is orderable");
+
+        let position = |c: &ChannelUrl| ordered.iter().position(|o| o == c).unwrap();
+        assert!(position(&top) < position(&left));
+        assert!(position(&top) < position(&right));
+        assert!(position(&left) < position(&bottom));
+        assert!(position(&right) < position(&bottom));
+    }
+
+    /// The order must not wander between runs: which channels are involved is
+    /// metadata-driven, and a solve that shuffles would be worse than one that
+    /// is merely wrong.
+    #[test]
+    fn the_order_is_stable() {
+        let nodes = [channel("a"), channel("b"), channel("c")];
+        let edges = [(channel("a"), channel("c"))];
+        let first = topological_order(&nodes, &edges).unwrap();
+        for _ in 0..8 {
+            assert_eq!(topological_order(&nodes, &edges).unwrap(), first);
+        }
+    }
+
+    /// Relations as a channel would declare them: `(channel, base, overrides)`,
+    /// where the references are CEP-42 relative paths.
+    fn declaring(
+        relations: &[(&str, Option<&str>, Option<&str>)],
+    ) -> BTreeMap<ChannelUrl, ChannelRelations> {
+        relations
+            .iter()
+            .map(|(name, base, overrides)| {
+                (
+                    channel(name),
+                    ChannelRelations {
+                        base: base.map(ToString::to_string),
+                        overrides: overrides.map(ToString::to_string),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Walks `relations` from `root`, standing in for a gateway serving repodata
+    /// that declares them.
+    async fn chain_from(
+        root: &str,
+        relations: &[(&str, Option<&str>, Option<&str>)],
+    ) -> Result<Vec<ChannelUrl>, ViewError> {
+        let declared = declaring(relations);
+        relation_chain(channel(root), |current| {
+            let relations = declared.get(&current).cloned();
+            async move { Ok(relations) }
+        })
+        .await
+    }
+
+    /// The `base`/`overrides` directions, through the walk rather than through
+    /// `topological_order` on hand-built edges.
+    #[tokio::test]
+    async fn a_chain_follows_both_kinds_of_relation() {
+        let chain = chain_from("mine", &[("mine", Some("../up/"), Some("../old/"))])
+            .await
+            .expect("these relations are orderable");
+
+        assert_eq!(chain, [channel("up"), channel("mine"), channel("old")]);
+    }
+
+    /// CEP-42: "Clients MUST detect cycles in this graph and abort resolution
+    /// with an error when a cycle is detected."
+    #[tokio::test]
+    async fn a_cycle_between_channels_is_refused() {
+        let error = chain_from(
+            "a",
+            &[("a", Some("../b/"), None), ("b", Some("../a/"), None)],
+        )
+        .await
+        .expect_err("two channels each based on the other cannot be ordered");
+
+        assert!(
+            matches!(&error, ViewError::Cycle { channel: root } if root == &channel("a")),
+            "expected a cycle rooted at the channel asked for, got: {error}"
+        );
+    }
+
+    /// A cycle that closes further out is still a cycle: the walk has to detect
+    /// it wherever it is, not only when the root is part of it.
+    #[tokio::test]
+    async fn a_cycle_beyond_the_root_is_refused() {
+        let error = chain_from(
+            "a",
+            &[
+                ("a", Some("../b/"), None),
+                ("b", Some("../c/"), None),
+                ("c", Some("../b/"), None),
+            ],
+        )
+        .await
+        .expect_err("a cycle among the channels reached is still a cycle");
+
+        assert!(matches!(error, ViewError::Cycle { .. }), "got: {error}");
+    }
+
+    /// CEP-42: "A channel MUST NOT declare both `base` and `overrides`
+    /// referencing the same channel; clients MUST treat this as an error."
+    #[tokio::test]
+    async fn naming_one_channel_as_both_base_and_overridden_is_refused() {
+        let error = chain_from("mine", &[("mine", Some("../up/"), Some("../up/"))])
+            .await
+            .expect_err("one channel cannot be both above and below another");
+
+        assert!(
+            matches!(
+                &error,
+                ViewError::ContradictoryRelations { channel: declaring, reference }
+                    if declaring == &channel("mine") && reference == &channel("up")
+            ),
+            "expected the declaring channel and the channel it named twice, got: {error}"
+        );
+    }
+
+    /// Only *one channel* declaring both roles is the contradiction. Two
+    /// channels naming the same base is an ordinary diamond, and refusing it
+    /// would reject a legitimate arrangement.
+    #[tokio::test]
+    async fn two_channels_sharing_a_base_is_not_a_contradiction() {
+        let chain = chain_from(
+            "a",
+            &[
+                ("a", Some("../shared/"), Some("../b/")),
+                ("b", Some("../shared/"), None),
+            ],
+        )
+        .await
+        .expect("two channels may share a base");
+
+        assert_eq!(chain, [channel("shared"), channel("a"), channel("b")]);
+    }
+
+    /// CEP-42: "If the depth limit is exceeded, the client SHOULD abort
+    /// resolution with an error." Each hop through a relation costs one.
+    #[tokio::test]
+    async fn relations_deeper_than_the_cap_are_refused() {
+        let names: Vec<String> = (0..=DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH + 2)
+            .map(|step| format!("step{step}"))
+            .collect();
+        let references: Vec<String> = names.iter().map(|name| format!("../{name}/")).collect();
+        let relations: Vec<(&str, Option<&str>, Option<&str>)> = names
+            .iter()
+            .enumerate()
+            .map(|(step, name)| {
+                (
+                    name.as_str(),
+                    references.get(step + 1).map(String::as_str),
+                    None,
+                )
+            })
+            .collect();
+
+        let error = chain_from(&names[0], &relations)
+            .await
+            .expect_err("a chain longer than the cap must not be followed");
+
+        assert!(
+            matches!(
+                &error,
+                ViewError::TooDeep { channel: root, limit }
+                    if root == &channel("step0") && *limit == DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH
+            ),
+            "expected the root and the cap that was exceeded, got: {error}"
+        );
+    }
+
+    /// A chain exactly at the cap is allowed: the limit is the last depth that
+    /// still resolves, so an off-by-one here would reject valid metadata.
+    #[tokio::test]
+    async fn relations_up_to_the_cap_are_followed() {
+        let names: Vec<String> = (0..=DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH)
+            .map(|step| format!("step{step}"))
+            .collect();
+        let references: Vec<String> = names.iter().map(|name| format!("../{name}/")).collect();
+        let relations: Vec<(&str, Option<&str>, Option<&str>)> = names
+            .iter()
+            .enumerate()
+            .map(|(step, name)| {
+                (
+                    name.as_str(),
+                    references.get(step + 1).map(String::as_str),
+                    None,
+                )
+            })
+            .collect();
+
+        let chain = chain_from(&names[0], &relations)
+            .await
+            .expect("a chain at the cap is still within it");
+
+        assert_eq!(chain.len(), names.len());
+    }
+
+    /// A reference the gateway would refuse -- anything not a `../` relative
+    /// path -- contributes no edge rather than failing the whole view.
+    #[tokio::test]
+    async fn an_unresolvable_reference_is_ignored() {
+        let chain = chain_from(
+            "mine",
+            &[("mine", Some("https://elsewhere.example/evil/"), None)],
+        )
+        .await
+        .expect("a reference that does not resolve is skipped");
+
+        assert_eq!(chain, [channel("mine")]);
     }
 
     #[test]
