@@ -7,13 +7,11 @@ use rattler_conda_types::GenericVirtualPackage;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 use rattler_conda_types::{Channel, ChannelConfig, PackageName, Platform};
 #[cfg(feature = "experimental-virtual-package-plugins")]
-use rattler_repodata_gateway::{
-    DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH, Gateway, resolve_channel_relation,
-};
+use rattler_repodata_gateway::Gateway;
 /// The names every client detects itself. Owned by the plugins crate, which
 /// needs the same list to say what its built-in factory speaks for.
 #[cfg(feature = "experimental-virtual-package-plugins")]
-use rattler_virtual_package_plugins::STANDARDIZED_VIRTUAL_PACKAGES;
+use rattler_virtual_package_plugins::{STANDARDIZED_VIRTUAL_PACKAGES, channel_view};
 use rattler_virtual_packages::VirtualPackageOverrides;
 
 /// Print detected virtual packages.
@@ -134,7 +132,10 @@ async fn print_plugins(
 
     for channel in &channels {
         for platform in &platforms {
-            let chain = base_chain(&gateway, channel, *platform).await?;
+            let view = channel_view(&gateway, channel, *platform)
+                .await
+                .into_diagnostic()?;
+            let chain: Vec<_> = view.chain.into_iter().map(Channel::from_url).collect();
             let claims = collect_claims(&gateway, &chain, *platform).await?;
             if claims.is_empty() {
                 continue;
@@ -186,53 +187,6 @@ impl std::fmt::Display for Claim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.plugin.as_source(), self.channel)
     }
-}
-
-/// The chain of channels `channel` inherits virtual packages from: itself
-/// first, then each [CEP-42] `base` in turn.
-///
-/// Only `base` is followed. It names the channel of higher priority that the
-/// declaring channel builds on, so its virtual packages are in scope; an
-/// `overrides` edge points the other way, at a channel being superseded.
-///
-/// References resolve through [`resolve_channel_relation`], so a reference the
-/// gateway would refuse is skipped here too, and one already in the chain ends
-/// the walk, which terminates a `base` cycle. The depth cap is CEP-42's own
-/// [`DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH`].
-///
-/// [CEP-42]: https://github.com/conda/ceps/blob/main/cep-0042.md
-#[cfg(feature = "experimental-virtual-package-plugins")]
-async fn base_chain(
-    gateway: &Gateway,
-    channel: &Channel,
-    platform: Platform,
-) -> miette::Result<Vec<Channel>> {
-    let mut chain = vec![channel.clone()];
-    let mut seen = std::collections::HashSet::from([channel.base_url.clone()]);
-
-    while chain.len() <= DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH {
-        let declaring = chain.last().expect("seeded above");
-        let Some(relations) = gateway
-            .channel_relations(declaring, platform)
-            .await
-            .into_diagnostic()?
-        else {
-            break;
-        };
-        let Some(base) = relations
-            .base
-            .as_deref()
-            .and_then(|base| resolve_channel_relation(&declaring.base_url, base))
-        else {
-            break;
-        };
-        if !seen.insert(base.clone()) {
-            break;
-        }
-        chain.push(Channel::from_url(base));
-    }
-
-    Ok(chain)
 }
 
 /// Every virtual package the chain registers, mapped to the claims on it in
@@ -371,7 +325,7 @@ async fn detect_plugins(
     };
     use rattler_repodata_gateway::SubdirVirtualPackagePlugins;
     use rattler_virtual_package_plugins::{
-        DetectOptions, detect_virtual_packages, resolve_plugins,
+        DetectOptions, PluginContext, detect_virtual_packages, resolve_views,
     };
 
     if channels.is_empty() {
@@ -422,59 +376,83 @@ async fn detect_plugins(
             });
         }
     }
-    let resolution = resolve_plugins(registrations).map_err(|err| miette::miette!(err))?;
+    // One view per channel asked about: the channel plus everything it inherits
+    // through a `base` chain. Views are independent, so two unrelated channels
+    // each answer for their own names rather than one shadowing the other.
+    let mut views = Vec::new();
+    for channel in &channels {
+        views.push(
+            channel_view(&gateway, channel, platform)
+                .await
+                .into_diagnostic()?,
+        );
+    }
+    let resolved_views =
+        resolve_views(&views, registrations).map_err(|err| miette::miette!(err))?;
 
-    let mut current_channel = None;
-    for resolved in resolution.plugins.iter().chain(&resolution.shadowed) {
-        if current_channel != Some(&resolved.channel) {
-            current_channel = Some(&resolved.channel);
-            println!(
-                "\n{}{} {}",
-                console::Emoji("🔌 ", ""),
-                console::style(&resolved.channel).bold(),
-                console::style(format!("[{platform}]")).dim(),
-            );
-        }
+    let context = PluginContext {
+        gateway: &gateway,
+        package_cache: &package_cache,
+        detection_cache: &detection_cache,
+        environment_root: &environment_root,
+        host_platform: platform,
+        timeout,
+        now,
+    };
 
-        if resolved.provides.is_empty() {
-            report_shadowed(resolved);
+    for view in &resolved_views {
+        if view.plugins.is_empty() && view.shadowed.is_empty() {
             continue;
         }
 
-        let channel = channels
-            .iter()
-            .find(|channel| channel.base_url == resolved.channel)
-            .expect("every resolved plugin came from one of these channels");
-        let detection = detect_virtual_packages(DetectOptions {
-            gateway: &gateway,
-            package_cache: &package_cache,
-            detection_cache: &detection_cache,
-            channel,
-            plugin: &resolved.plugin,
-            declared: &resolved.declared,
-            environment_root: &environment_root,
-            host_platform: platform,
-            timeout,
-            now,
-        })
-        .await;
+        println!(
+            "\n{}{} {}",
+            console::Emoji("🔌 ", ""),
+            console::style(&view.channel).bold(),
+            console::style(format!("[{platform}]")).dim(),
+        );
 
-        match detection {
-            Ok(detection) => report_detection(resolved, &detection, show_timings),
-            Err(err) => {
-                println!(
-                    "  {} {} {}",
-                    console::style(console::Emoji("✖", "x")).red(),
-                    console::style(resolved.plugin.as_source()).bold(),
-                    console::style("(skipped)").dim(),
-                );
-                for line in explain(&err) {
-                    println!("      {}", console::style(line).red());
-                }
-                // The plugin's own account of what went wrong, which is
-                // usually more specific than anything this side can say.
-                for line in err.plugin_stderr().into_iter().flat_map(str::lines) {
-                    println!("      {}", console::style(line).dim());
+        for resolved in view.plugins.iter().chain(&view.shadowed) {
+            if resolved.provides.is_empty() {
+                report_shadowed(resolved);
+                continue;
+            }
+
+            let channel = channels
+                .iter()
+                .find(|channel| channel.base_url == resolved.channel)
+                .expect("every resolved plugin came from one of these channels");
+            let detection = detect_virtual_packages(DetectOptions {
+                gateway: context.gateway,
+                package_cache: context.package_cache,
+                detection_cache: context.detection_cache,
+                channel,
+                plugin: &resolved.plugin,
+                declared: &resolved.declared,
+                environment_root: context.environment_root,
+                host_platform: context.host_platform,
+                timeout: context.timeout,
+                now: context.now,
+            })
+            .await;
+
+            match detection {
+                Ok(detection) => report_detection(resolved, &detection, show_timings),
+                Err(err) => {
+                    println!(
+                        "  {} {} {}",
+                        console::style(console::Emoji("✖", "x")).red(),
+                        console::style(resolved.plugin.as_source()).bold(),
+                        console::style("(skipped)").dim(),
+                    );
+                    for line in explain(&err) {
+                        println!("      {}", console::style(line).red());
+                    }
+                    // The plugin's own account of what went wrong, which is
+                    // usually more specific than anything this side can say.
+                    for line in err.plugin_stderr().into_iter().flat_map(str::lines) {
+                        println!("      {}", console::style(line).dim());
+                    }
                 }
             }
         }

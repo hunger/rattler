@@ -64,6 +64,8 @@ pub use factory::{
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use protocol::{CachePolicy, Detected, PluginReport, ProtocolError, parse_report};
 #[cfg(feature = "experimental-virtual-package-plugins")]
-pub use resolve::{ConflictingClaim, ResolvedPlugin, resolve_plugins};
+pub use resolve::{
+    ChannelView, ConflictingClaim, ResolvedPlugin, ResolvedView, channel_view, resolve_views,
+};
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use runner::{PluginRun, RunOptions, RunTimeout, RunnerError, run_plugin};

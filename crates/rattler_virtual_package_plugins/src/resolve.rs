@@ -1,26 +1,99 @@
-//! Deciding which plugin speaks for a virtual package.
+//! Deciding which plugin speaks for a virtual package, within a view.
 //!
-//! Two channels may each register a plugin for `__rocm`, and nothing in the
-//! metadata prevents it. The gateway reports both claims verbatim -- deciding
-//! between them is this module's job, and the rule is the one channels already
-//! follow everywhere else: **the highest-priority channel wins**.
+//! A **view** is one channel together with every channel it reaches through a
+//! CEP-42 `base` chain. It is the scope a virtual package lives in: a plugin's
+//! verdict is visible to the channel that registered it and to anything deriving
+//! from that channel, and nowhere else.
 //!
-//! Two plugins in *one* channel claiming the same virtual package is a
-//! different thing entirely. There is no priority to break that tie, and the
-//! channel is contradicting itself, so it is an error rather than a choice.
+//! Two consequences follow, and both are the point.
 //!
-//! What this does not decide is whether a plugin may speak for a virtual
-//! package clients detect themselves, such as `__cuda` or `__glibc`. That
-//! policy is still open; shadowing is reported elsewhere and nothing acts on it.
+//! **Independent channels never compete.** Two channels with no `base` edge
+//! between them may each register a plugin for `__rocm`, and both answer -- each
+//! within its own view. There is no contest to arbitrate and no loser, so
+//! nothing here consults the order the channels were listed in.
+//!
+//! **Inside a view, the derived channel wins.** A channel that builds on another
+//! may override what its base speaks for; that is what deriving from it means.
+//! The chain runs most-derived first, so the first claimant along it wins.
+//!
+//! Two plugins in *one* channel claiming the same virtual package is neither. It
+//! is a channel contradicting itself, with nothing to break the tie, so it is an
+//! error.
+//!
+//! Built-ins are the weakest source of all: a plugin claiming a name the client
+//! also detects overrides it. CEP 30 requires such a name to be *present* and
+//! does not dictate that the client's own detection is what fills it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
-use rattler_conda_types::{ChannelUrl, PackageName};
-use rattler_repodata_gateway::SubdirVirtualPackagePlugins;
+use rattler_conda_types::{Channel, ChannelUrl, PackageName, Platform};
+use rattler_repodata_gateway::{
+    DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH, Gateway, GatewayError, SubdirVirtualPackagePlugins,
+    resolve_channel_relation,
+};
 
 /// What one channel registered, once its subdirs have been folded together.
 type ChannelPlugins = IndexMap<PackageName, BTreeSet<PackageName>>;
+
+/// One channel and everything it inherits virtual packages from.
+///
+/// The scope a virtual package is resolved in. Views do not interact: a name
+/// claimed in one says nothing about the same name in another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelView {
+    /// The channel this view belongs to.
+    pub channel: ChannelUrl,
+
+    /// `channel` first, then each `base` in turn, most derived to least. A
+    /// claim earlier in the chain overrides the same claim later in it.
+    pub chain: Vec<ChannelUrl>,
+}
+
+/// The chain of channels `channel` inherits virtual packages from.
+///
+/// Only `base` is followed. It names the channel the declaring one builds on,
+/// so that channel's virtual packages are in scope; an `overrides` edge points
+/// the other way, at a channel being superseded.
+///
+/// References resolve through [`resolve_channel_relation`], so a reference the
+/// gateway would refuse is skipped here too, and one already in the chain ends
+/// the walk, which terminates a `base` cycle. The depth cap is CEP-42's own
+/// [`DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH`].
+pub async fn channel_view(
+    gateway: &Gateway,
+    channel: &Channel,
+    platform: Platform,
+) -> Result<ChannelView, GatewayError> {
+    let mut chain = vec![channel.base_url.clone()];
+    let mut seen = BTreeSet::from([channel.base_url.clone()]);
+
+    while chain.len() <= DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH {
+        let declaring = chain.last().expect("seeded above").clone();
+        let Some(relations) = gateway
+            .channel_relations(&Channel::from_url(declaring.clone()), platform)
+            .await?
+        else {
+            break;
+        };
+        let Some(base) = relations
+            .base
+            .as_deref()
+            .and_then(|base| resolve_channel_relation(&declaring, base))
+        else {
+            break;
+        };
+        if !seen.insert(base.clone()) {
+            break;
+        }
+        chain.push(base);
+    }
+
+    Ok(ChannelView {
+        channel: channel.base_url.clone(),
+        chain,
+    })
+}
 
 /// What a channel registered, and how much of it survived the contest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,20 +119,24 @@ pub struct ResolvedPlugin {
     pub shadowed_by: BTreeMap<PackageName, ChannelUrl>,
 }
 
-/// Which plugins to run, and which registrations lost.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Resolution {
-    /// The plugins to run, in channel-priority order and, within a channel, in
+/// What one view resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedView {
+    /// The channel whose view this is.
+    pub channel: ChannelUrl,
+
+    /// The plugins to run, most-derived channel first and, within a channel, in
     /// the order the channel listed them. Each provides at least one virtual
     /// package.
     pub plugins: Vec<ResolvedPlugin>,
 
-    /// Registrations that are not run at all, because a higher-priority channel
-    /// already speaks for every name they claimed. Their `provides` is empty.
+    /// Registrations that are not run at all, because a channel nearer the head
+    /// of this view's chain already speaks for every name they claimed. Their
+    /// `provides` is empty.
     ///
     /// Returned rather than dropped so a caller can say a registration was
-    /// skipped and why, instead of leaving a user to wonder where their plugin
-    /// went.
+    /// skipped and which channel took it, instead of leaving a user to wonder
+    /// where their plugin went.
     pub shadowed: Vec<ResolvedPlugin>,
 }
 
@@ -83,24 +160,46 @@ pub struct ConflictingClaim {
     pub second: PackageName,
 }
 
-/// Works out which plugins to run, given every registration a query saw.
+/// Works out which plugins to run in each view.
 ///
-/// `registrations` must be in resolved channel-priority order, which is what
-/// `RepoDataQueryOutput::virtual_package_plugins` yields. Subdirs of one channel
-/// are folded together: a channel repeats its registration in every subdir, so
-/// the same plugin appearing several times is one plugin, and what it is
-/// registered for is the union.
+/// One [`ResolvedView`] per view, in the order the views were given. Views are
+/// independent: a name claimed in one has no bearing on the same name in
+/// another, so nothing here compares two channels that do not share a chain.
 ///
-/// Plugins come back in channel-priority order, and within a channel in the
-/// order the channel listed them.
-pub fn resolve_plugins(
+/// `registrations` is every registration a query saw, in any order; each view
+/// takes the ones belonging to channels on its own chain. Subdirs of one channel
+/// are folded together, since a channel repeats its registration in every subdir
+/// and the same plugin appearing several times is one plugin registered for the
+/// union of what those subdirs said.
+pub fn resolve_views(
+    views: &[ChannelView],
     registrations: impl IntoIterator<Item = SubdirVirtualPackagePlugins>,
-) -> Result<Resolution, Box<ConflictingClaim>> {
-    let mut claimed: BTreeMap<PackageName, ChannelUrl> = BTreeMap::new();
-    let mut resolution = Resolution::default();
+) -> Result<Vec<ResolvedView>, Box<ConflictingClaim>> {
+    let folded = fold_subdirs(registrations);
+    views
+        .iter()
+        .map(|view| resolve_view(view, &folded))
+        .collect()
+}
 
-    for (channel, plugins) in fold_subdirs(registrations) {
-        check_for_self_conflict(&channel, &plugins)?;
+/// Resolves one view, walking its chain most-derived first so that a channel
+/// overrides the channels it derives from.
+fn resolve_view(
+    view: &ChannelView,
+    folded: &IndexMap<ChannelUrl, ChannelPlugins>,
+) -> Result<ResolvedView, Box<ConflictingClaim>> {
+    let mut claimed: BTreeMap<PackageName, ChannelUrl> = BTreeMap::new();
+    let mut resolved = ResolvedView {
+        channel: view.channel.clone(),
+        plugins: Vec::new(),
+        shadowed: Vec::new(),
+    };
+
+    for channel in &view.chain {
+        let Some(plugins) = folded.get(channel) else {
+            continue;
+        };
+        check_for_self_conflict(channel, plugins)?;
 
         for (plugin, declared) in plugins {
             let shadowed_by: BTreeMap<_, _> = declared
@@ -117,22 +216,22 @@ pub fn resolve_plugins(
                 claimed.insert(name.clone(), channel.clone());
             }
 
-            let resolved = ResolvedPlugin {
+            let plugin = ResolvedPlugin {
                 channel: channel.clone(),
-                plugin,
-                declared,
+                plugin: plugin.clone(),
+                declared: declared.clone(),
                 provides,
                 shadowed_by,
             };
-            if resolved.provides.is_empty() {
-                resolution.shadowed.push(resolved);
+            if plugin.provides.is_empty() {
+                resolved.shadowed.push(plugin);
             } else {
-                resolution.plugins.push(resolved);
+                resolved.plugins.push(plugin);
             }
         }
     }
 
-    Ok(resolution)
+    Ok(resolved)
 }
 
 /// Rejects a channel that registered two different plugins for one virtual
@@ -190,6 +289,14 @@ mod tests {
         PackageName::new_unchecked(name)
     }
 
+    /// A view over `chain`, most derived first.
+    fn view(chain: &[&str]) -> ChannelView {
+        ChannelView {
+            channel: channel(chain[0]),
+            chain: chain.iter().map(|name| channel(name)).collect(),
+        }
+    }
+
     /// One subdir's registration: `(plugin, [virtual packages])` pairs.
     fn subdir(
         channel_name: &str,
@@ -218,61 +325,120 @@ mod tests {
 
     #[test]
     fn a_single_uncontested_plugin_is_resolved() {
-        let resolution = resolve_plugins([subdir(
-            "org",
-            Platform::Linux64,
-            &[("rocm-detect", &["__rocm"])],
-        )])
+        let resolved = resolve_views(
+            &[view(&["org"])],
+            [subdir(
+                "org",
+                Platform::Linux64,
+                &[("rocm-detect", &["__rocm"])],
+            )],
+        )
         .unwrap();
 
-        assert_eq!(resolution.plugins.len(), 1);
-        assert_eq!(provides(&resolution.plugins[0]), ["__rocm"]);
-        assert!(resolution.plugins[0].shadowed_by.is_empty());
-        assert!(resolution.shadowed.is_empty());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].plugins.len(), 1);
+        assert_eq!(provides(&resolved[0].plugins[0]), ["__rocm"]);
+        assert!(resolved[0].plugins[0].shadowed_by.is_empty());
+        assert!(resolved[0].shadowed.is_empty());
     }
 
-    /// The rule the review settled on: between channels, priority decides.
+    /// Inside a view, the channel that derives from another overrides it. The
+    /// base is listed *after* the derived channel in the chain, which is what
+    /// makes deriving mean something.
     #[test]
-    fn the_highest_priority_channel_wins_a_contested_name() {
-        let resolution = resolve_plugins([
-            subdir("first", Platform::Linux64, &[("a-detect", &["__rocm"])]),
-            subdir("second", Platform::Linux64, &[("b-detect", &["__rocm"])]),
-        ])
+    fn a_derived_channel_overrides_its_base() {
+        let resolved = resolve_views(
+            &[view(&["derived", "base"])],
+            [
+                subdir("base", Platform::Linux64, &[("a-detect", &["__cuda"])]),
+                subdir("derived", Platform::Linux64, &[("b-detect", &["__cuda"])]),
+            ],
+        )
         .unwrap();
 
-        assert_eq!(resolution.plugins.len(), 1, "the loser must not be run");
-        assert_eq!(resolution.plugins[0].channel, channel("first"));
-        assert_eq!(resolution.plugins[0].plugin.as_source(), "a-detect");
+        assert_eq!(resolved[0].plugins.len(), 1, "the base must not also run");
+        assert_eq!(resolved[0].plugins[0].channel, channel("derived"));
 
-        // The loser is reported rather than dropped, so it can be explained.
-        assert_eq!(resolution.shadowed.len(), 1);
-        assert_eq!(resolution.shadowed[0].plugin.as_source(), "b-detect");
+        assert_eq!(resolved[0].shadowed.len(), 1);
+        assert_eq!(resolved[0].shadowed[0].channel, channel("base"));
         assert_eq!(
-            resolution.shadowed[0].shadowed_by.get(&name("__rocm")),
-            Some(&channel("first")),
-            "the loser has to say who took it"
+            resolved[0].shadowed[0].shadowed_by.get(&name("__cuda")),
+            Some(&channel("derived")),
+            "a shadowed registration has to say who took it"
         );
     }
 
-    /// A plugin can lose one name and keep another. It still runs, and it is
-    /// still held to everything its channel registered it for -- only the
-    /// verdicts for the lost names go nowhere.
+    /// The rule this replaces: two channels with no relationship used to fight
+    /// over a name, and the one listed first won. They are separate views now
+    /// and never meet, so both answer.
     #[test]
-    fn a_partially_shadowed_plugin_still_runs_for_what_it_wins() {
-        let resolution = resolve_plugins([
-            subdir("first", Platform::Linux64, &[("a-detect", &["__rocm"])]),
-            subdir(
-                "second",
-                Platform::Linux64,
-                &[("b-detect", &["__rocm", "__oneapi"])],
-            ),
-        ])
+    fn independent_channels_do_not_compete() {
+        let resolved = resolve_views(
+            &[view(&["first"]), view(&["second"])],
+            [
+                subdir("first", Platform::Linux64, &[("a-detect", &["__rocm"])]),
+                subdir("second", Platform::Linux64, &[("b-detect", &["__rocm"])]),
+            ],
+        )
         .unwrap();
 
-        assert_eq!(resolution.plugins.len(), 2);
-        assert!(resolution.shadowed.is_empty(), "it still runs");
+        assert_eq!(resolved.len(), 2);
+        for (index, expected) in [(0, "first"), (1, "second")] {
+            assert_eq!(
+                resolved[index].plugins.len(),
+                1,
+                "{expected} answers for __rocm in its own view"
+            );
+            assert_eq!(resolved[index].plugins[0].channel, channel(expected));
+            assert!(
+                resolved[index].shadowed.is_empty(),
+                "there is no contest to lose"
+            );
+        }
+    }
 
-        let partial = &resolution.plugins[1];
+    /// A view only sees the channels on its own chain, so a registration
+    /// elsewhere is not resolved into it at all.
+    #[test]
+    fn a_view_ignores_channels_outside_its_chain() {
+        let resolved = resolve_views(
+            &[view(&["org"])],
+            [
+                subdir("org", Platform::Linux64, &[("a-detect", &["__rocm"])]),
+                subdir(
+                    "elsewhere",
+                    Platform::Linux64,
+                    &[("b-detect", &["__oneapi"])],
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].plugins.len(), 1);
+        assert_eq!(provides(&resolved[0].plugins[0]), ["__rocm"]);
+    }
+
+    /// A plugin can lose one name to its base and keep another. It still runs,
+    /// and is still held to everything its channel registered it for.
+    #[test]
+    fn a_partially_shadowed_plugin_still_runs_for_what_it_wins() {
+        let resolved = resolve_views(
+            &[view(&["derived", "base"])],
+            [
+                subdir("derived", Platform::Linux64, &[("a-detect", &["__rocm"])]),
+                subdir(
+                    "base",
+                    Platform::Linux64,
+                    &[("b-detect", &["__rocm", "__oneapi"])],
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].plugins.len(), 2);
+        assert!(resolved[0].shadowed.is_empty(), "it still runs");
+
+        let partial = &resolved[0].plugins[1];
         assert_eq!(provides(partial), ["__oneapi"]);
         assert_eq!(
             partial.shadowed_by.keys().collect::<Vec<_>>(),
@@ -288,15 +454,18 @@ mod tests {
     /// seen twice is one plugin -- not a channel contradicting itself.
     #[test]
     fn subdirs_of_one_channel_are_folded_rather_than_compared() {
-        let resolution = resolve_plugins([
-            subdir("org", Platform::Linux64, &[("d-detect", &["__rocm"])]),
-            subdir("org", Platform::NoArch, &[("d-detect", &["__oneapi"])]),
-        ])
+        let resolved = resolve_views(
+            &[view(&["org"])],
+            [
+                subdir("org", Platform::Linux64, &[("d-detect", &["__rocm"])]),
+                subdir("org", Platform::NoArch, &[("d-detect", &["__oneapi"])]),
+            ],
+        )
         .unwrap();
 
-        assert_eq!(resolution.plugins.len(), 1, "one plugin, not two");
+        assert_eq!(resolved[0].plugins.len(), 1, "one plugin, not two");
         assert_eq!(
-            provides(&resolution.plugins[0]),
+            provides(&resolved[0].plugins[0]),
             ["__oneapi", "__rocm"],
             "what the subdirs registered is unioned"
         );
@@ -305,11 +474,14 @@ mod tests {
     /// Nothing can break this tie, and running either would be a guess.
     #[test]
     fn two_plugins_in_one_channel_claiming_one_name_is_an_error() {
-        let error = resolve_plugins([subdir(
-            "org",
-            Platform::Linux64,
-            &[("a-detect", &["__rocm"]), ("b-detect", &["__rocm"])],
-        )])
+        let error = resolve_views(
+            &[view(&["org"])],
+            [subdir(
+                "org",
+                Platform::Linux64,
+                &[("a-detect", &["__rocm"]), ("b-detect", &["__rocm"])],
+            )],
+        )
         .unwrap_err();
 
         assert_eq!(error.virtual_package, name("__rocm"));
@@ -317,26 +489,13 @@ mod tests {
         assert_eq!(error.second, name("b-detect"));
     }
 
-    /// The conflict is within one channel, so the same two plugin names in two
-    /// different channels is the ordinary contest, not the error.
-    #[test]
-    fn the_same_claim_from_two_channels_is_not_a_conflict() {
-        let resolution = resolve_plugins([
-            subdir("first", Platform::Linux64, &[("a-detect", &["__rocm"])]),
-            subdir("second", Platform::Linux64, &[("a-detect", &["__rocm"])]),
-        ])
-        .unwrap();
-
-        assert_eq!(resolution.plugins.len(), 1);
-        assert_eq!(resolution.plugins[0].channel, channel("first"));
-    }
-
     #[test]
     fn registering_nothing_resolves_to_nothing() {
-        assert_eq!(resolve_plugins([]).unwrap(), Resolution::default());
-        assert_eq!(
-            resolve_plugins([subdir("org", Platform::Linux64, &[])]).unwrap(),
-            Resolution::default()
-        );
+        assert!(resolve_views(&[], []).unwrap().is_empty());
+
+        let resolved =
+            resolve_views(&[view(&["org"])], [subdir("org", Platform::Linux64, &[])]).unwrap();
+        assert!(resolved[0].plugins.is_empty());
+        assert!(resolved[0].shadowed.is_empty());
     }
 }

@@ -17,12 +17,12 @@ beyond the feature flag itself.
 | `info.virtual_package_plugins` parsing (`repodata.json` and sharded index) | Implemented |
 | `Gateway::virtual_package_plugins(channel, platform)` accessor | Implemented |
 | Registrations on `RepoDataQueryOutput`, per channel subdir | Implemented |
-| Inherited and shadowed registrations along the CEP-42 `base` chain | Implemented (reported, not resolved) |
+| Inherited and shadowed registrations along the CEP-42 `base` chain | Implemented and resolved |
 | Plugin report protocol (one JSON object) | Implemented |
 | Contract check of output against the registration | Implemented |
 | `SourcedVirtualPackage` result type, carrying a `BuiltIn` or `Plugin` source | Implemented |
 | `rattler virtual-packages -c <channel> [--detect]` | Implemented |
-| Conflict resolution across channels | Implemented -- highest-priority channel wins |
+| Resolution per view (channel + its `base` chain) | Implemented -- derived overrides base; independent channels do not compete |
 | Running a plugin out of an existing environment, activated | Implemented |
 | Detection result cache | Implemented |
 | Plugin environment creation | Implemented |
@@ -615,35 +615,43 @@ Duplicate claims are preserved verbatim in both: two channels each claiming `__r
 within one channel each claiming `__rocm`, all come back, and no warning is raised. Deciding which
 plugin wins happens a layer up, in `resolve`.
 
-### Conflict Resolution
+### Views, and Resolution Within Them
 
-Two channels may each register a plugin for `__rocm`, and nothing in the metadata prevents it.
-`resolve::resolve_plugins` decides between them, and the rule is the one channels already follow
-everywhere else: **the highest-priority channel wins**. It takes the registrations in resolved
-channel-priority order -- what `RepoDataQueryOutput::virtual_package_plugins` yields -- and walks
-them in order, giving each virtual package to the first channel that claims it.
+A **view** is one channel together with every channel it reaches through a CEP-42 `base` chain. It
+is the scope a virtual package lives in, and it is what `resolve::resolve_views` resolves: one
+result per view, never one global answer.
 
-Three things fall out of that, and each is deliberate:
+**Independent channels do not compete.** Two channels with no `base` edge between them may each
+register a plugin for `__rocm`, and both answer -- each within its own view. There is no contest,
+no loser, and nothing consults the order the channels were listed in. This is what carrying the
+source on each virtual package buys: two `__rocm`s can coexist because each records which channel
+it answers for.
+
+**Inside a view, the derived channel overrides its base.** That is what deriving from a channel
+means: a private channel declaring `base: conda-forge` may replace what conda-forge speaks for. The
+chain runs most-derived first and the first claimant along it wins, so the result does not depend on
+the order the channels were given on the command line.
+
+Three further things, each deliberate:
 
 **Subdirs of one channel are folded, not compared.** A channel repeats its registration in every
-subdir, so the same plugin seen twice is one plugin, and what it is registered for is the union of
-what its subdirs said.
+subdir, so the same plugin seen twice is one plugin, registered for the union of what its subdirs
+said.
 
-**Two plugins in one channel claiming one name is an error**, not a contest. There is no priority to
-break that tie, and a channel registering both `a-detect` and `b-detect` for `__rocm` is
-contradicting itself. Detection fails rather than guessing, and it fails before any of that
-channel's plugins runs.
+**Two plugins in one channel claiming one name is an error**, not a contest. Nothing breaks that
+tie, and a channel registering both `a-detect` and `b-detect` for `__rocm` is contradicting itself.
+Detection fails rather than guessing, before any of that channel's plugins runs.
 
 **A plugin can lose one name and keep another.** It still runs, for what it won, and it is still
 held to *everything* its channel registered it for: the contract is between the plugin and its
-channel, and losing `__rocm` to a higher-priority channel does not excuse the plugin from giving a
-verdict on it. The verdict is simply discarded. A plugin that loses every name is not run at all --
-but it is still returned, in `Resolution::shadowed`, so a caller can say a registration was skipped
-and which channel took it, rather than leaving a user to wonder where their plugin went.
+channel, and losing `__cuda` to a channel deriving from it does not excuse the plugin from giving a
+verdict. The verdict is discarded rather than never asked for. A plugin that loses every name is not
+run at all, but is still returned in `ResolvedView::shadowed`, so a caller can say a registration was
+skipped and which channel took it.
 
-What this does *not* decide is whether a plugin may speak for a virtual package clients detect
-themselves, such as `__cuda` or `__glibc`. That policy is still open (see the open questions);
-shadowing of that kind is reported by `rattler virtual-packages` and nothing acts on it.
+**Built-ins are the weakest source.** A plugin claiming a name the client also detects overrides it.
+CEP 30 requires such a name to be *present* and does not dictate that the client's own detection is
+what fills it, so a channel that knows better about `__cuda` may say so.
 
 `resolve_channel_relation` is exported so a caller resolving a CEP-42 `base`/`overrides` reference
 outside a query resolves it the same way the query path does. That validation stops malicious metadata
@@ -758,8 +766,9 @@ the arrangement that motivated grouping in the first place: one driver connectio
    `index.json` are untouched, so a client learns what a plugin provides without fetching the plugin's
    record first.
 4. **No version constraints in the registration.** Bare package name, latest version.
-5. **The gateway reports, `resolve` decides.** Registrations come back per subdir in channel-priority
-   order with duplicates intact; the highest-priority channel wins each contested name.
+5. **The gateway reports, `resolve` decides.** Registrations come back per subdir with duplicates
+   intact. Resolution is per view: a derived channel overrides its base, and channels with no `base`
+   relationship never compete because they are separate views.
 6. **Plugin identity is (channel, package name)** for conflict resolution, and a hash over the whole
    solved plugin environment for caching, so it changes when a dependency does.
 7. **The report is one JSON object keyed by virtual package name**, with `null` for absent. Absence
@@ -890,7 +899,7 @@ What stays strict is the contract: a verdict about a virtual package the channel
 plugin for is still an error, because that is a channel disagreeing with itself rather than a version
 skew.
 
-### 3. Conflict resolution across channels -- done
+### 3. Conflict resolution across channels -- done, then superseded
 
 > **Wolf Vollprecht** (on *Deliberately not done -- reported as declared, caller decides*) --
 > I think we said "highest priority channel wins"?
@@ -913,7 +922,13 @@ Two cases the thread did not cover, decided while building it:
   would leave a user wondering where their plugin went.
 
 `rattler virtual-packages --detect` now resolves across all the channels it was given before running
-anything, rather than running each channel's registrations independently. Whether a plugin-provided
+anything, rather than running each channel's registrations independently.
+
+**Superseded since.** Highest-priority-channel-wins was the wrong frame: it made two channels with
+no relationship to each other fight over a name, with list order picking the winner. Channels are
+independent, and each sees its own plugins, so resolution is now per *view* -- a channel plus its
+`base` chain. Inside a view the derived channel overrides its base; across views nothing competes.
+See *Views, and Resolution Within Them* above. Whether a plugin-provided
 name may shadow a *built-in* one is a separate question and stays open (see below).
 
 ### 4. The one-second timeout -- done
