@@ -252,6 +252,48 @@ impl VirtualPackageFactory for PluginVirtualPackages<'_> {
     }
 }
 
+/// Resolves only the factories that could affect a solve, and combines what they
+/// find with the built-ins.
+///
+/// `needed` is the set of virtual package names the solve could ask for, from
+/// [`virtual_packages_mentioned`](crate::demand::virtual_packages_mentioned). A
+/// factory whose [`provides`](VirtualPackageFactory::provides) does not
+/// intersect it is never resolved: nothing in the solve can constrain on what it
+/// speaks for, so what it would report cannot change the answer. That is the
+/// whole point of `provides` being cheap.
+///
+/// The built-ins are resolved regardless. CEP 30 obliges the client to offer
+/// them whether or not anything asks, they cost a synchronous read of this
+/// machine rather than a plugin run, and skipping them would be the one saving
+/// that changes what a solve is allowed to see.
+///
+/// Factories are resolved in the order given, which for a view is CEP-42
+/// priority order.
+pub async fn resolve_needed(
+    built_in: &BuiltinVirtualPackages,
+    plugins: &[impl VirtualPackageFactory + Sync],
+    needed: &BTreeSet<PackageName>,
+) -> Result<Vec<SourcedVirtualPackage>, FactoryError> {
+    let mut from_plugins = Vec::new();
+
+    for factory in plugins {
+        if factory.provides().is_disjoint(needed) {
+            tracing::debug!(
+                "not resolving a source for {:?}: nothing in this solve mentions any of them",
+                factory
+                    .provides()
+                    .iter()
+                    .map(PackageName::as_source)
+                    .collect::<Vec<_>>()
+            );
+            continue;
+        }
+        from_plugins.extend(factory.resolve().await?);
+    }
+
+    Ok(combine(&built_in.resolve().await?, from_plugins))
+}
+
 /// The virtual packages a view offers: everything its plugins found, plus the
 /// built-ins none of them replaced.
 ///
@@ -269,7 +311,7 @@ impl VirtualPackageFactory for PluginVirtualPackages<'_> {
 /// detected one is already meeting the CEP; a plugin contradicting that is
 /// asserting something the CEP does not let it assert.
 pub fn combine(
-    built_in: Vec<SourcedVirtualPackage>,
+    built_in: &[SourcedVirtualPackage],
     from_plugins: Vec<SourcedVirtualPackage>,
 ) -> Vec<SourcedVirtualPackage> {
     let produced: BTreeSet<_> = from_plugins
@@ -277,16 +319,20 @@ pub fn combine(
         .map(|detected| detected.package.name.clone())
         .collect();
 
-    let kept: Vec<_> = built_in
-        .into_iter()
-        .filter(|detected| !produced.contains(&detected.package.name))
-        .inspect(|detected| {
-            tracing::debug!(
-                "keeping the built-in {}: no plugin in this view produced it",
-                detected.package.name.as_source()
-            );
-        })
-        .collect();
+    let (replaced, kept): (Vec<_>, Vec<_>) = built_in
+        .iter()
+        .cloned()
+        .partition(|detected| produced.contains(&detected.package.name));
+
+    if !replaced.is_empty() {
+        tracing::debug!(
+            "a plugin in this view replaced the built-in {:?}",
+            replaced
+                .iter()
+                .map(|detected| detected.package.name.as_source())
+                .collect::<Vec<_>>()
+        );
+    }
 
     from_plugins.into_iter().chain(kept).collect()
 }
@@ -386,7 +432,7 @@ mod tests {
 
         // The plugin claimed __archspec and found nothing, so it produced
         // nothing: an empty result, not an entry saying absent.
-        let combined = combine(built_in, Vec::new());
+        let combined = combine(&built_in, Vec::new());
 
         assert!(
             combined
@@ -412,7 +458,7 @@ mod tests {
                 build_string: "from-a-plugin".to_string(),
             },
         };
-        let combined = combine(built_in, vec![from_plugin]);
+        let combined = combine(&built_in, vec![from_plugin]);
 
         let found: Vec<_> = combined
             .iter()
@@ -420,6 +466,87 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1, "the name must not be reported twice");
         assert_eq!(found[0].package.build_string, "from-a-plugin");
+    }
+
+    /// A factory that fails the test if anything resolves it. The saving is the
+    /// whole point, so it has to be observable that the work did not happen --
+    /// asserting on the output alone would pass even if the plugin had run.
+    struct MustNotRun(BTreeSet<PackageName>);
+
+    #[async_trait]
+    impl VirtualPackageFactory for MustNotRun {
+        fn provides(&self) -> &BTreeSet<PackageName> {
+            &self.0
+        }
+
+        async fn resolve(&self) -> Result<Vec<SourcedVirtualPackage>, FactoryError> {
+            panic!("resolved a source nothing in the solve mentions");
+        }
+    }
+
+    fn speaking_for(names: &[&str]) -> MustNotRun {
+        MustNotRun(
+            names
+                .iter()
+                .map(|n| PackageName::new_unchecked(*n))
+                .collect(),
+        )
+    }
+
+    fn needing(names: &[&str]) -> BTreeSet<PackageName> {
+        names
+            .iter()
+            .map(|n| PackageName::new_unchecked(*n))
+            .collect()
+    }
+
+    /// Nothing mentions `__rocm`, so whatever would have detected it never runs.
+    #[tokio::test]
+    async fn a_source_nothing_mentions_is_not_resolved() {
+        let resolved = resolve_needed(
+            &BuiltinVirtualPackages::from_env(),
+            &[speaking_for(&["__rocm"])],
+            &needing(&["__cuda", "__glibc"]),
+        )
+        .await
+        .expect("skipping a source cannot fail");
+
+        assert!(
+            resolved
+                .iter()
+                .all(|detected| detected.source.is_built_in()),
+            "only the built-ins should be here"
+        );
+    }
+
+    /// A source speaking for several names runs if *any* of them is mentioned:
+    /// one plugin answers for all its names at once, so there is nothing finer
+    /// to skip.
+    #[tokio::test]
+    async fn one_mentioned_name_is_enough_to_resolve_a_source() {
+        let factory = speaking_for(&["__rocm", "__oneapi"]);
+        assert!(!factory.provides().is_disjoint(&needing(&["__oneapi"])));
+    }
+
+    /// The built-ins are resolved whether or not anything mentions them: CEP 30
+    /// obliges the client to offer them, and they cost a read of this machine
+    /// rather than a plugin run.
+    #[tokio::test]
+    async fn the_built_ins_are_resolved_even_when_unmentioned() {
+        let resolved = resolve_needed(
+            &BuiltinVirtualPackages::from_env(),
+            &[speaking_for(&["__rocm"])],
+            &needing(&[]),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            resolved
+                .iter()
+                .any(|d| d.package.name == PackageName::new_unchecked("__archspec")),
+            "CEP 30 requires __archspec regardless of what the solve asks for"
+        );
     }
 
     /// The hand-written list has to keep up with what detection actually

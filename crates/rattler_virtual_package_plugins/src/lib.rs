@@ -64,7 +64,7 @@ pub use environment::{
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use factory::{
     BuiltinVirtualPackages, FactoryError, PluginContext, PluginVirtualPackages,
-    STANDARDIZED_VIRTUAL_PACKAGES, VirtualPackageFactory, combine,
+    STANDARDIZED_VIRTUAL_PACKAGES, VirtualPackageFactory, combine, resolve_needed,
 };
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use protocol::{CachePolicy, Detected, PluginReport, ProtocolError, parse_report};

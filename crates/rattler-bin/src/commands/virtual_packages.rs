@@ -432,10 +432,8 @@ async fn detect_plugins(
             console::style(format!("[{platform}]")).dim(),
         );
 
-        // Collected as the plugins run, because which built-ins survive depends
-        // on what the plugins actually produced -- not on what they claimed. A
-        // plugin that claims `__archspec` and finds nothing must not take the
-        // built-in down with it.
+        // Which built-ins survive depends on what the plugins produced, not on
+        // what they claimed, so this is collected as they run.
         let mut produced: Vec<rattler_conda_types::SourcedVirtualPackage> = Vec::new();
 
         for resolved in view.plugins.iter().chain(&view.shadowed) {
@@ -492,10 +490,9 @@ async fn detect_plugins(
             }
         }
 
-        // `combine` decides which built-ins a plugin actually replaced, which is
-        // also what keeps a name CEP 30 mandates from vanishing when a channel's
+        // `combine` is what keeps a name CEP 30 mandates from vanishing when a
         // plugin claims it and comes back empty.
-        for detected in combine(built_in.clone(), produced.clone())
+        for detected in combine(&built_in, produced)
             .into_iter()
             .filter(|detected| detected.source.is_built_in())
         {

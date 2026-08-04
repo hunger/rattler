@@ -344,9 +344,26 @@ pub trait VirtualPackageFactory {
 
 That split is the whole point of calling it a factory rather than a list. A caller can see what a
 factory *would* answer for and skip resolving one whose names nothing needs, instead of paying for
-every plugin a channel happens to register. In both specializations `provides` is what the source
-claims and `resolve` is what turned out to be there; a name reported absent simply does not come
-back.
+every plugin a channel happens to register.
+
+`resolve_needed` is where that pays off. Given the set of names a solve could ask for -- from
+`demand::virtual_packages_mentioned`, a scan of the `depends` and `constrains` already in memory --
+it resolves only the factories whose `provides` intersects it. A plugin speaking only for `__rocm`,
+in a solve where nothing mentions `__rocm`, is never solved for, installed or run. The built-ins are
+resolved regardless: CEP 30 obliges the client to offer them whether or not anything asks, and they
+cost a read of this machine rather than a plugin run.
+
+**Why here and not inside the solver.** Resolving strictly when the solver first reaches a name
+would be narrower still, and `resolvo`'s `get_candidates` is `async` precisely so a provider can do
+work there. It cannot be this work: `rattler_solve` drives the solver on resolvo's default
+`NowOrNeverRuntime`, which panics on any future that yields, and switching it to a tokio handle
+would make `solve()` panic whenever it is called from inside an async context -- which is where
+`rattler-bin`, py-rattler and pixi all call it from. The scan is a bound rather than an oracle: a
+name mentioned by a package the solver would never have considered still costs a plugin run. In
+exchange it needs no change to the solver and no new way for a caller to crash.
+
+In both specializations `provides` is what the source claims and `resolve` is what turned out to be
+there; a name reported absent simply does not come back.
 
 **`BuiltinVirtualPackages`** wraps `VirtualPackage::detect`. Its results carry `BuiltIn`, so they
 belong to no channel and appear in every view.
@@ -1037,8 +1054,8 @@ binary fixture is expensive to notice.
 > in Pixi. I don't really understand the reasoning. We do this all the time and should be able to
 > work around this if it is really an issue.
 >
-> **Tobias Hunger** -- I asked Claude to be paranoid when doing this. A plugin might be malicious
-> after all. We can lift that restriction if we can all agree that is not a problem.
+> **Tobias Hunger** -- The intent here was to be paranoid. A plugin might be malicious after all. We
+> can lift that restriction if we can all agree that is not a problem.
 
 **Done: lifted.** Strictness buys nothing against a malicious plugin -- it already runs arbitrary
 code -- and it costs forward compatibility: an older client would reject a plugin written for a
@@ -1068,7 +1085,7 @@ Two cases the thread did not cover, decided while building it:
 - A plugin that loses *some* of its names still runs for the rest, and is still held to everything
   its channel registered it for. The contract is between the plugin and its channel; the verdicts
   for lost names are simply discarded.
-- A plugin that loses *all* of them is not run, but is still returned in `Resolution::shadowed`, so
+- A plugin that loses *all* of them is not run, but is still returned in `ResolvedView::shadowed`, so
   `--detect` can say the registration was skipped and which channel took it. Dropping it silently
   would leave a user wondering where their plugin went.
 
@@ -1137,7 +1154,7 @@ caps how much there can be.
 
 **No change, and the consumer now exists.** Conflict resolution (thread 3) is what reads it: which
 channel a verdict came from is exactly what decides whether it is used or discarded, and
-`Resolution::shadowed_by` names the winner so a skipped registration can be explained rather than
+`ResolvedPlugin::shadowed_by` names the winner so a skipped registration can be explained rather than
 just omitted.
 
 ### 7. Activation scripts -- done
