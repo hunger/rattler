@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use rattler_cache::package_cache::PackageCache;
-use rattler_conda_types::{Channel, ChannelConfig, PackageName, Platform};
+use rattler_conda_types::{Channel, ChannelConfig, PackageName, Platform, VirtualPackageSource};
 use rattler_repodata_gateway::Gateway;
 use rattler_virtual_package_plugins::{
     PluginEnvironmentOptions, RunOptions, RunTimeout, ensure_plugin_environment, parse_report,
@@ -214,9 +214,19 @@ async fn detection_is_cached_between_calls() {
     reported.sort();
     assert_eq!(reported, ["__foobar=1.2.3", "__foobar_arch=0=gen4"]);
 
-    // Provenance travels with each virtual package.
+    // The source travels with each virtual package, naming the channel whose
+    // view it belongs to and the plugin build that produced it.
     for detected in &first.virtual_packages {
-        assert_eq!(detected.channel, channel.base_url);
+        let VirtualPackageSource::Plugin {
+            channel: from,
+            plugin: by,
+            ..
+        } = &detected.source
+        else {
+            panic!("a plugin's verdict must not be reported as a built-in");
+        };
+        assert_eq!(*from, channel.base_url);
+        assert_eq!(*by, plugin);
     }
 
     let second = detect_virtual_packages(options(1_000)).await.unwrap();

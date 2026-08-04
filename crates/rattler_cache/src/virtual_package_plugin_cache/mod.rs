@@ -14,7 +14,7 @@ mod cache_key;
 use std::path::{Path, PathBuf};
 
 pub use cache_key::CacheKey;
-use rattler_conda_types::ChannelVirtualPackage;
+use rattler_conda_types::SourcedVirtualPackage;
 use serde::{Deserialize, Serialize};
 
 /// The state of a watched path when the verdicts were recorded.
@@ -130,7 +130,7 @@ pub struct WatchList {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedDetection {
     /// What the plugin reported, ready to hand to a solve.
-    pub virtual_packages: Vec<ChannelVirtualPackage>,
+    pub virtual_packages: Vec<SourcedVirtualPackage>,
 
     /// When these verdicts stop being usable, in seconds since the Unix epoch.
     /// `None` means no time limit, so only `watched` can invalidate them.
@@ -153,7 +153,7 @@ impl CachedDetection {
     /// `now` is a parameter rather than read from the clock so expiry is
     /// testable without waiting.
     pub fn record(
-        virtual_packages: Vec<ChannelVirtualPackage>,
+        virtual_packages: Vec<SourcedVirtualPackage>,
         ttl_seconds: Option<u64>,
         watch: &WatchList,
         now: i64,
@@ -243,7 +243,7 @@ impl VirtualPackagePluginCache {
 
 #[cfg(test)]
 mod tests {
-    use rattler_conda_types::{GenericVirtualPackage, PackageName};
+    use rattler_conda_types::{GenericVirtualPackage, PackageName, VirtualPackageSource};
     use rattler_digest::{Sha256, compute_bytes_digest};
 
     use super::*;
@@ -264,10 +264,13 @@ mod tests {
         }
     }
 
-    fn detected() -> Vec<ChannelVirtualPackage> {
-        vec![ChannelVirtualPackage {
-            channel: url::Url::parse("https://prefix.dev/org/").unwrap().into(),
-            plugin_sha256: compute_bytes_digest::<Sha256>([1]),
+    fn detected() -> Vec<SourcedVirtualPackage> {
+        vec![SourcedVirtualPackage {
+            source: VirtualPackageSource::Plugin {
+                channel: url::Url::parse("https://prefix.dev/org/").unwrap().into(),
+                plugin: PackageName::new_unchecked("cuda-detect"),
+                environment: compute_bytes_digest::<Sha256>([1]),
+            },
             package: GenericVirtualPackage {
                 name: PackageName::new_unchecked("__cuda"),
                 version: "12.4".parse().unwrap(),

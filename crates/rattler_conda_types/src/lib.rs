@@ -21,8 +21,6 @@ pub mod utils;
 mod version;
 pub mod version_spec;
 
-#[cfg(feature = "experimental-virtual-package-plugins")]
-mod channel_virtual_package;
 pub mod compression_level;
 mod environment_yaml;
 mod generic_virtual_package;
@@ -33,6 +31,8 @@ pub mod prefix;
 pub mod prefix_data;
 pub mod prefix_record;
 mod record_traits;
+#[cfg(feature = "experimental-virtual-package-plugins")]
+mod sourced_virtual_package;
 
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -40,8 +40,6 @@ use std::path::{Path, PathBuf};
 pub use build_spec::{BuildNumber, BuildNumberSpec, OrdOperator, ParseBuildNumberSpecError};
 pub use channel::{Channel, ChannelConfig, ChannelUrl, NamedChannelOrUrl, ParseChannelError};
 pub use channel_data::{ChannelData, ChannelDataPackage};
-#[cfg(feature = "experimental-virtual-package-plugins")]
-pub use channel_virtual_package::ChannelVirtualPackage;
 pub use environment_yaml::{EnvironmentYaml, MatchSpecOrSubSection};
 pub use explicit_environment_spec::{
     ExplicitEnvironmentEntry, ExplicitEnvironmentSpec, PackageArchiveHash,
@@ -80,6 +78,8 @@ pub use repo_data::{
 };
 pub use repo_data_record::{RepoDataRecord, SolverResult};
 pub use run_export::RunExportKind;
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use sourced_virtual_package::{SourcedVirtualPackage, VirtualPackageSource};
 pub use version::{
     Component, ParseVersionError, ParseVersionErrorKind, StrictVersion, Version, VersionBumpError,
     VersionBumpType, VersionExtendError, VersionWithSource,

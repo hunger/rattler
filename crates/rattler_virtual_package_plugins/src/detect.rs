@@ -16,7 +16,9 @@ use rattler_cache::{
         CacheKey, CachedDetection, VirtualPackagePluginCache, WatchList,
     },
 };
-use rattler_conda_types::{Channel, ChannelVirtualPackage, PackageName, Platform};
+use rattler_conda_types::{
+    Channel, PackageName, Platform, SourcedVirtualPackage, VirtualPackageSource,
+};
 use rattler_repodata_gateway::Gateway;
 
 use crate::{
@@ -32,8 +34,8 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Detection {
     /// The virtual packages the plugin reported present, each carrying the
-    /// channel and the plugin environment that produced it.
-    pub virtual_packages: Vec<ChannelVirtualPackage>,
+    /// source that produced it.
+    pub virtual_packages: Vec<SourcedVirtualPackage>,
 
     /// Whether this came from the cache rather than from running the plugin.
     pub from_cache: bool,
@@ -226,9 +228,12 @@ pub async fn detect_virtual_packages(options: DetectOptions<'_>) -> Result<Detec
 
     let virtual_packages: Vec<_> = report
         .present()
-        .map(|package| ChannelVirtualPackage {
-            channel: channel.base_url.clone(),
-            plugin_sha256: environment.sha256,
+        .map(|package| SourcedVirtualPackage {
+            source: VirtualPackageSource::Plugin {
+                channel: channel.base_url.clone(),
+                plugin: plugin.clone(),
+                environment: environment.sha256,
+            },
             package,
         })
         .collect();

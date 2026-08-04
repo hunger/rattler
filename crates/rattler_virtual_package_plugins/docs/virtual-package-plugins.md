@@ -20,7 +20,7 @@ beyond the feature flag itself.
 | Inherited and shadowed registrations along the CEP-42 `base` chain | Implemented (reported, not resolved) |
 | Plugin report protocol (one JSON object) | Implemented |
 | Contract check of output against the registration | Implemented |
-| `ChannelVirtualPackage` result type | Implemented |
+| `SourcedVirtualPackage` result type, carrying a `BuiltIn` or `Plugin` source | Implemented |
 | `rattler virtual-packages -c <channel> [--detect]` | Implemented |
 | Conflict resolution across channels | Implemented -- highest-priority channel wins |
 | Running a plugin out of an existing environment, activated | Implemented |
@@ -36,7 +36,7 @@ beyond the feature flag itself.
 | Piece | Crate | Status |
 | --- | --- | --- |
 | `info.virtual_package_plugins` type and parsing | `rattler_conda_types` | done |
-| `ChannelVirtualPackage` | `rattler_conda_types` | done |
+| `SourcedVirtualPackage` | `rattler_conda_types` | done |
 | Registration accessors and query output | `rattler_repodata_gateway` | done |
 | Report protocol, contract check | `rattler_virtual_package_plugins` | done |
 | Activating a plugin's prefix (`activation`) | `rattler_virtual_package_plugins` | done |
@@ -45,7 +45,7 @@ beyond the feature flag itself.
 | Orchestration (`detect`) | `rattler_virtual_package_plugins` | done |
 | Detection result cache | `rattler_cache` | done |
 
-`ChannelVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
+`SourcedVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
 because the result cache belongs in `rattler_cache`, beside `package_cache` and `run_exports_cache`,
 and `rattler_cache` cannot depend on `rattler_virtual_package_plugins` without a cycle.
 
@@ -181,20 +181,33 @@ plugin, it:
 6. **Caches the verdicts** under the plugin's own cache policy, keyed by the same hash.
 
 7. **Injects the results** into the solver's virtual package set alongside the built-ins, as
-   `ChannelVirtualPackage`s -- but only the ones this plugin won (see *Conflict Resolution*):
+   `SourcedVirtualPackage`s -- but only the ones this plugin won (see *Conflict Resolution*):
 
 ```rust
-pub struct ChannelVirtualPackage {
-    pub channel: ChannelUrl,
-    pub plugin_sha256: Sha256Hash,
+pub struct SourcedVirtualPackage {
+    pub source: VirtualPackageSource,
     pub package: GenericVirtualPackage,
+}
+
+pub enum VirtualPackageSource {
+    BuiltIn,
+    Plugin { channel: ChannelUrl, plugin: PackageName, environment: Sha256Hash },
 }
 ```
 
-   The channel and the hash travel with the virtual package so provenance survives into whatever
-   decides between two channels' claims on the same name. The solver itself still consumes plain
-   `GenericVirtualPackage`s: it interns them by name and offers them as candidates, so scoping by
-   channel stays the caller's job.
+   **The source is not decoration.** It says which channels a virtual package is visible to, which
+   is what allows two independent channels to each answer for a name without one of them having to
+   lose. A `BuiltIn` belongs to no channel and is visible everywhere -- CEP 30 makes the standard
+   virtual packages an obligation of the *client*, not of any channel, so one cannot be missing
+   however the channels are configured. A `Plugin` value is visible to the channel that registered
+   it and to any channel reaching that one through a CEP-42 `base` chain.
+
+   Carrying it on the value is the precondition for keeping those sets apart: without it there is
+   nowhere to record which channel a given `__rocm` answers for, and two of them collapse into one
+   the moment they are put in a list together.
+
+   The solver itself still consumes plain `GenericVirtualPackage`s: it interns them by name and
+   offers them as candidates, so scoping stays the caller's job for now.
 
 ### Plugin Interface
 
@@ -382,13 +395,23 @@ channel must not be able to place a file outside the cache directory.
 {
   "virtual_packages": [
     {
-      "channel": "file:///path/to/channels/virtual-package-plugins",
-      "plugin_sha256": "72029f5d5cf06962118b1863f7873826e48566014d12d0c6cf7dd7160964cea1",
+      "source": {
+        "plugin": {
+          "channel": "file:///path/to/channels/virtual-package-plugins",
+          "plugin": "foobar-detect",
+          "environment": "72029f5d5cf06962118b1863f7873826e48566014d12d0c6cf7dd7160964cea1"
+        }
+      },
       "package": "__foobar=1.2.3"
     },
     {
-      "channel": "file:///path/to/channels/virtual-package-plugins",
-      "plugin_sha256": "72029f5d5cf06962118b1863f7873826e48566014d12d0c6cf7dd7160964cea1",
+      "source": {
+        "plugin": {
+          "channel": "file:///path/to/channels/virtual-package-plugins",
+          "plugin": "foobar-detect",
+          "environment": "72029f5d5cf06962118b1863f7873826e48566014d12d0c6cf7dd7160964cea1"
+        }
+      },
       "package": "__foobar_arch=0=gen4"
     }
   ],
@@ -403,8 +426,10 @@ channel must not be able to place a file outside the cache directory.
 ```
 
 - **`virtual_packages`** -- the verdicts, each carrying provenance. `package` is the
-  `name=version=build_string` form, with the build string omitted when empty. `plugin_sha256` identifies
-  the plugin environment rather than the plugin archive.
+  `name=version=build_string` form, with the build string omitted when empty. `environment` identifies
+  the plugin environment rather than the plugin archive, so it changes when a dependency of the plugin
+  does. A built-in would be stored as `{"source": "built_in"}`, though nothing caches those: they are
+  cheap to redetect and belong to no channel.
 - **`expires_at`** -- seconds since the Unix epoch, derived from the `ttl_seconds` the plugin asked
   for. Every entry has one: **a plugin cannot ask to be cached forever.** What it can do is ask for
   longer or shorter, within a maximum, and add watches that expire the entry *sooner*.
@@ -687,8 +712,9 @@ the arrangement that motivated grouping in the first place: one driver connectio
 12. **The plugin declares its own cache policy** (`ttl_seconds`, `watch_paths`, `watch_env`) in its
     report, within bounds the client sets: every entry expires, in an hour by default and thirty
     days at the most.
-13. **Results carry provenance** as `ChannelVirtualPackage`; the solver still receives plain
-    `GenericVirtualPackage`s.
+13. **Results carry their source** as `SourcedVirtualPackage` -- `BuiltIn`, or `Plugin` with the
+    channel, plugin package and environment hash. The source is what scopes a virtual package to the
+    channels that can see it; the solver still receives plain `GenericVirtualPackage`s.
 14. **A plugin is never asked for a subset of what it was registered for.** Grouping names under one
     plugin is the statement that they share their expensive work; splitting the cost is what
     separate plugin packages are for.

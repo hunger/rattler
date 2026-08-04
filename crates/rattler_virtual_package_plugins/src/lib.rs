@@ -16,7 +16,7 @@
 //! - [`resolve`] decides which plugin speaks for a virtual package two channels
 //!   both claim.
 //! - [`detect`] composes all of those with a cache and returns
-//!   [`ChannelVirtualPackage`](rattler_conda_types::ChannelVirtualPackage)s.
+//!   [`SourcedVirtualPackage`](rattler_conda_types::SourcedVirtualPackage)s.
 //!
 //! [`detect::detect_virtual_packages`] is the entry point. The rest is public
 //! because it is useful on its own to a caller that wants to do part of this
