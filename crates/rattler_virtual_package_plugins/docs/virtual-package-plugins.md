@@ -250,6 +250,21 @@ The list is written out because `rattler_virtual_packages` exposes no enumeratio
 detects; they live in its `From<VirtualPackage> for GenericVirtualPackage` impls. It now lives with
 the factory, and `rattler virtual-packages` imports it from there rather than keeping its own copy.
 
+**`PluginVirtualPackages`** is the other specialization: one per plugin a view resolved to, wrapping
+`detect_virtual_packages`. Everything expensive about detection sits behind its `resolve`, so a
+caller that does not need any of the names it offers never solves for the plugin, installs it or
+runs it.
+
+Its `provides` is what the plugin **won**, not everything its channel registered it for. Those
+differ when another channel in the same view already speaks for one of its names: the plugin is
+still held to reporting a verdict on that name -- the contract is between the plugin and its
+channel, and losing a name does not excuse it -- but the verdict is dropped rather than offered.
+`declared` and `provides` on `ResolvedPlugin` keep the two apart.
+
+What every plugin in a run shares -- the gateway, the caches, the prefix root, the platform, the
+timeout, and the single `now` they must all agree on -- is a `PluginContext`, passed once rather
+than repeated per plugin.
+
 The trait lives in `rattler_virtual_package_plugins` rather than in `rattler_virtual_packages`.
 That crate is light, stable and entirely synchronous, and resolving a plugin is neither; defining
 the trait there would make it async for the sake of an experiment. Everything here stays behind

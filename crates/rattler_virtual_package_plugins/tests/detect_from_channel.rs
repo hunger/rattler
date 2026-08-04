@@ -246,3 +246,89 @@ async fn detection_is_cached_between_calls() {
     assert!(!expired.from_cache, "an expired entry must not be reused");
     assert_eq!(expired.virtual_packages, first.virtual_packages);
 }
+
+/// A plugin factory offers only the names the plugin won, and drops verdicts for
+/// the rest.
+///
+/// The distinction matters: the plugin is still held to reporting a verdict on
+/// everything its channel registered it for, so the contract check has to see
+/// the full set, while a caller must only be offered what this plugin actually
+/// speaks for in its view.
+#[tokio::test]
+async fn a_plugin_factory_offers_only_what_the_plugin_won() {
+    use std::collections::BTreeSet;
+
+    use rattler_cache::virtual_package_plugin_cache::VirtualPackagePluginCache;
+    use rattler_virtual_package_plugins::{
+        PluginContext, PluginVirtualPackages, ResolvedPlugin, VirtualPackageFactory,
+    };
+
+    let cache = tempfile::tempdir().unwrap();
+    let channel = fixture_channel();
+    let plugin = PackageName::new_unchecked("foobar-detect");
+    let platform = Platform::current();
+
+    let gateway = Gateway::builder()
+        .with_cache_dir(cache.path().join("repodata"))
+        .with_package_cache(PackageCache::new(cache.path().join("pkgs")))
+        .finish();
+    let package_cache = PackageCache::new(cache.path().join("pkgs"));
+    let detection_cache = VirtualPackagePluginCache::new(cache.path().join("detections"));
+    let environment_root = cache.path().join("plugins");
+
+    let declared: BTreeSet<_> = gateway
+        .virtual_package_plugins(&channel, platform)
+        .await
+        .unwrap()
+        .get(&plugin)
+        .expect("registered by the fixture channel")
+        .iter()
+        .cloned()
+        .collect();
+
+    // The fixture registers two names. Pretend something else in this view
+    // already speaks for one of them, so only the other is won.
+    let won = PackageName::new_unchecked("__foobar");
+    assert!(
+        declared.len() > 1,
+        "the fixture must register more than one"
+    );
+    let resolved = ResolvedPlugin {
+        channel: channel.base_url.clone(),
+        plugin: plugin.clone(),
+        declared: declared.clone(),
+        provides: BTreeSet::from([won.clone()]),
+        shadowed_by: std::collections::BTreeMap::default(),
+    };
+
+    let factory = PluginVirtualPackages::new(
+        &resolved,
+        &channel,
+        PluginContext {
+            gateway: &gateway,
+            package_cache: &package_cache,
+            detection_cache: &detection_cache,
+            environment_root: &environment_root,
+            host_platform: platform,
+            timeout: RunTimeout::default(),
+            now: 1_000,
+        },
+    );
+
+    assert_eq!(
+        factory.provides(),
+        &BTreeSet::from([won.clone()]),
+        "a factory offers what the plugin won, not what its channel registered"
+    );
+
+    let resolved_packages = factory.resolve().await.expect("the fixture plugin runs");
+    let names: Vec<_> = resolved_packages
+        .iter()
+        .map(|detected| detected.package.name.as_source().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        ["__foobar"],
+        "the verdict for the name it lost must not be offered"
+    );
+}

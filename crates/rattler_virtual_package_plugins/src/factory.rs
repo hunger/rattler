@@ -21,12 +21,24 @@
 //! specializations `provides` is what the source claims and `resolve` is what
 //! turned out to be there: names reported absent simply do not come back.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 use async_trait::async_trait;
-use rattler_conda_types::{PackageName, SourcedVirtualPackage, VirtualPackageSource};
+use rattler_cache::{
+    package_cache::PackageCache, virtual_package_plugin_cache::VirtualPackagePluginCache,
+};
+use rattler_conda_types::{
+    Channel, PackageName, Platform, SourcedVirtualPackage, VirtualPackageSource,
+};
+use rattler_repodata_gateway::Gateway;
 use rattler_virtual_packages::{
     DetectVirtualPackageError, VirtualPackage, VirtualPackageOverrides,
+};
+
+use crate::{
+    detect::{DetectError, DetectOptions, detect_virtual_packages},
+    resolve::ResolvedPlugin,
+    runner::RunTimeout,
 };
 
 /// A source of virtual packages.
@@ -52,6 +64,14 @@ pub enum FactoryError {
     /// This system's own virtual packages could not be determined.
     #[error("failed to determine the virtual packages of this system")]
     BuiltIn(#[from] DetectVirtualPackageError),
+
+    /// A channel's plugin could not be run, or did not honour its registration.
+    ///
+    /// Boxed because a detection failure carries the plugin's stderr and the
+    /// chain of causes beneath it, which makes it far larger than the other
+    /// variant and would otherwise weigh down every `Result` in this module.
+    #[error(transparent)]
+    Plugin(#[from] Box<DetectError>),
 }
 
 /// The virtual packages this client detects itself.
@@ -127,6 +147,107 @@ impl VirtualPackageFactory for BuiltinVirtualPackages {
                 source: VirtualPackageSource::BuiltIn,
                 package: package.into(),
             })
+            .collect())
+    }
+}
+
+/// The virtual packages one channel's plugin detects.
+///
+/// One of these per plugin a view resolved to, so the expensive work is behind
+/// exactly the names that plugin won and a caller can skip it if nothing needs
+/// them.
+pub struct PluginVirtualPackages<'a> {
+    resolved: &'a ResolvedPlugin,
+    channel: &'a Channel,
+    context: PluginContext<'a>,
+}
+
+/// What every plugin factory in one run shares: where to fetch from, where to
+/// cache, and the bounds a plugin run is held to.
+///
+/// Separate from [`ResolvedPlugin`] because it is the same for every plugin in a
+/// run, while the resolution differs per plugin.
+#[derive(Clone, Copy)]
+pub struct PluginContext<'a> {
+    /// Where to read channel repodata from.
+    pub gateway: &'a Gateway,
+
+    /// The package cache a plugin's install draws from.
+    pub package_cache: &'a PackageCache,
+
+    /// Where detection results are kept between runs.
+    pub detection_cache: &'a VirtualPackagePluginCache,
+
+    /// Directory the per-plugin prefixes live under.
+    pub environment_root: &'a Path,
+
+    /// The platform to solve plugins for; detection is host-only.
+    pub host_platform: Platform,
+
+    /// How long a plugin may run before it is killed.
+    pub timeout: RunTimeout,
+
+    /// The current time in seconds since the Unix epoch, for cache expiry. One
+    /// value for a whole run so every plugin agrees on what now is.
+    pub now: i64,
+}
+
+impl<'a> PluginVirtualPackages<'a> {
+    /// A factory for one plugin a view resolved to.
+    ///
+    /// `channel` must be the [`Channel`] the resolution named; it is taken
+    /// separately because resolution works in `ChannelUrl`s while fetching needs
+    /// the full channel.
+    pub fn new(
+        resolved: &'a ResolvedPlugin,
+        channel: &'a Channel,
+        context: PluginContext<'a>,
+    ) -> Self {
+        debug_assert_eq!(
+            channel.base_url, resolved.channel,
+            "a plugin factory must be given the channel that registered it"
+        );
+        Self {
+            resolved,
+            channel,
+            context,
+        }
+    }
+}
+
+#[async_trait]
+impl VirtualPackageFactory for PluginVirtualPackages<'_> {
+    fn provides(&self) -> &BTreeSet<PackageName> {
+        // What the plugin *won*, not everything its channel registered it for.
+        // A name another channel in this view already speaks for is not on
+        // offer here, even though the plugin is still held to reporting it.
+        &self.resolved.provides
+    }
+
+    async fn resolve(&self) -> Result<Vec<SourcedVirtualPackage>, FactoryError> {
+        let detection = detect_virtual_packages(DetectOptions {
+            gateway: self.context.gateway,
+            package_cache: self.context.package_cache,
+            detection_cache: self.context.detection_cache,
+            channel: self.channel,
+            plugin: &self.resolved.plugin,
+            declared: &self.resolved.declared,
+            environment_root: self.context.environment_root,
+            host_platform: self.context.host_platform,
+            timeout: self.context.timeout,
+            now: self.context.now,
+        })
+        .await
+        .map_err(Box::new)?;
+
+        // The plugin answers for everything its channel registered it for, but
+        // only what it won is on offer. The rest is dropped here rather than
+        // never asked for: the contract is between the plugin and its channel,
+        // so it still had to give a verdict.
+        Ok(detection
+            .virtual_packages
+            .into_iter()
+            .filter(|detected| self.resolved.provides.contains(&detected.package.name))
             .collect())
     }
 }
