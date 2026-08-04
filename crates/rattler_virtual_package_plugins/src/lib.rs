@@ -15,6 +15,8 @@
 //! - [`contract`] checks those verdicts against what the channel registered.
 //! - [`resolve`] decides which plugin speaks for a virtual package two channels
 //!   both claim.
+//! - [`factory`] is the common shape for anything that produces virtual
+//!   packages, whether this client detected them or a channel's plugin did.
 //! - [`detect`] composes all of those with a cache and returns
 //!   [`SourcedVirtualPackage`](rattler_conda_types::SourcedVirtualPackage)s.
 //!
@@ -32,6 +34,8 @@ pub mod contract;
 pub mod detect;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod environment;
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod factory;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod protocol;
 #[cfg(feature = "experimental-virtual-package-plugins")]
@@ -51,6 +55,10 @@ pub use detect::{
 pub use environment::{
     EnvironmentError, EnvironmentTimings, PluginEnvironment, PluginEnvironmentOptions,
     ensure_plugin_environment, environment_sha256,
+};
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use factory::{
+    BuiltinVirtualPackages, FactoryError, STANDARDIZED_VIRTUAL_PACKAGES, VirtualPackageFactory,
 };
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use protocol::{CachePolicy, Detected, PluginReport, ProtocolError, parse_report};

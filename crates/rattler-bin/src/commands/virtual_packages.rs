@@ -10,6 +10,10 @@ use rattler_conda_types::{Channel, ChannelConfig, PackageName, Platform};
 use rattler_repodata_gateway::{
     DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH, Gateway, resolve_channel_relation,
 };
+/// The names every client detects itself. Owned by the plugins crate, which
+/// needs the same list to say what its built-in factory speaks for.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+use rattler_virtual_package_plugins::STANDARDIZED_VIRTUAL_PACKAGES;
 use rattler_virtual_packages::VirtualPackageOverrides;
 
 /// Print detected virtual packages.
@@ -168,29 +172,6 @@ async fn print_plugins(
     Ok(())
 }
 
-/// Virtual packages every client detects itself, so a plugin registering one
-/// shadows a name the solver already fills in.
-///
-/// Names rather than a rattler API because [`rattler_virtual_packages`] exposes
-/// no enumeration: they live in the `From<VirtualPackage> for
-/// GenericVirtualPackage` impls. `standardized_names_stay_in_sync` guards the
-/// drift.
-#[cfg(feature = "experimental-virtual-package-plugins")]
-const STANDARDIZED_VIRTUAL_PACKAGES: &[&str] = &[
-    "__unix",
-    "__linux",
-    "__win",
-    "__osx",
-    "__ios",
-    "__android",
-    "__glibc",
-    "__musl",
-    "__eglibc",
-    "__cuda",
-    "__cuda_arch",
-    "__archspec",
-];
-
 /// One channel's registration of one virtual package. `depth` is the distance
 /// along `base` edges from the channel asked about, so `0` is its own claim.
 #[cfg(feature = "experimental-virtual-package-plugins")]
@@ -328,39 +309,7 @@ fn override_warnings(claims: &IndexMap<PackageName, Vec<Claim>>) -> Vec<String> 
 
 #[cfg(all(test, feature = "experimental-virtual-package-plugins"))]
 mod tests {
-    use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
-
     use super::*;
-
-    /// Guards [`STANDARDIZED_VIRTUAL_PACKAGES`] against rattler gaining a
-    /// virtual package it detects that this list doesn't know about -- an
-    /// unlisted name means a plugin could shadow it without a warning.
-    ///
-    /// Only covers names that appear in per-platform detection, so ones that
-    /// are never a default (`__cuda`, `__cuda_arch`, and the non-glibc libc
-    /// flavors) still have to be added by hand.
-    #[test]
-    fn standardized_names_stay_in_sync() {
-        let overrides = VirtualPackageOverrides::default();
-        for platform in [
-            Platform::Linux64,
-            Platform::LinuxAarch64,
-            Platform::Osx64,
-            Platform::OsxArm64,
-            Platform::Win64,
-            Platform::EmscriptenWasm32,
-        ] {
-            let detected = VirtualPackages::detect_for_platform(platform, &overrides)
-                .expect("detection for a known platform");
-            for package in detected.into_generic_virtual_packages() {
-                let name = package.name.as_source().to_string();
-                assert!(
-                    STANDARDIZED_VIRTUAL_PACKAGES.contains(&name.as_str()),
-                    "{platform} detects {name}, which STANDARDIZED_VIRTUAL_PACKAGES omits"
-                );
-            }
-        }
-    }
 
     /// The claim on a name registered by both a channel and the channel it
     /// inherits from is reported as an override, and a lone claim is not.

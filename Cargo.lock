@@ -5591,6 +5591,7 @@ dependencies = [
 name = "rattler_virtual_package_plugins"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "fs-err",
  "hex",
  "indexmap 2.14.0",

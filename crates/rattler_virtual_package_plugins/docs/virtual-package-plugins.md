@@ -43,6 +43,7 @@ beyond the feature flag itself.
 | Running a plugin (`runner`) | `rattler_virtual_package_plugins` | done |
 | Environment creation (`environment`) | `rattler_virtual_package_plugins` | done |
 | Orchestration (`detect`) | `rattler_virtual_package_plugins` | done |
+| `VirtualPackageFactory` and the built-in source (`factory`) | `rattler_virtual_package_plugins` | done |
 | Detection result cache | `rattler_cache` | done |
 
 `SourcedVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
@@ -208,6 +209,51 @@ pub enum VirtualPackageSource {
 
    The solver itself still consumes plain `GenericVirtualPackage`s: it interns them by name and
    offers them as candidates, so scoping stays the caller's job for now.
+
+### Factories
+
+A caller assembling the virtual packages for a solve deals with two kinds of source: the ones this
+client detects itself, which CEP 30 obliges it to offer, and the ones a channel's plugin reports.
+They behave nothing alike -- one is a synchronous read of the running system, the other installs an
+environment and starts a process -- but a caller should not have to know which it is holding.
+
+`VirtualPackageFactory` is that common shape, and it splits the cheap question from the expensive
+one:
+
+```rust
+#[async_trait]
+pub trait VirtualPackageFactory {
+    /// The names this source speaks for. Costs nothing.
+    fn provides(&self) -> &BTreeSet<PackageName>;
+
+    /// What is actually on this system. May be slow.
+    async fn resolve(&self) -> Result<Vec<SourcedVirtualPackage>, FactoryError>;
+}
+```
+
+That split is the whole point of calling it a factory rather than a list. A caller can see what a
+factory *would* answer for and skip resolving one whose names nothing needs, instead of paying for
+every plugin a channel happens to register. In both specializations `provides` is what the source
+claims and `resolve` is what turned out to be there; a name reported absent simply does not come
+back.
+
+**`BuiltinVirtualPackages`** wraps `VirtualPackage::detect`. Its results carry `BuiltIn`, so they
+belong to no channel and appear in every view.
+
+Its `provides` is a fixed list, `STANDARDIZED_VIRTUAL_PACKAGES`, rather than the result of
+detecting. That keeps the cheap contract honest, and it is also the right answer: `provides` means
+"names this source speaks for", not "names it will find". `__cuda` is a name this client speaks for
+on a machine with no GPU -- it looks, and reports absence. Deriving the list by detecting would
+conflate the two and make `provides` cost exactly what it exists to avoid.
+
+The list is written out because `rattler_virtual_packages` exposes no enumeration of the names it
+detects; they live in its `From<VirtualPackage> for GenericVirtualPackage` impls. It now lives with
+the factory, and `rattler virtual-packages` imports it from there rather than keeping its own copy.
+
+The trait lives in `rattler_virtual_package_plugins` rather than in `rattler_virtual_packages`.
+That crate is light, stable and entirely synchronous, and resolving a plugin is neither; defining
+the trait there would make it async for the sake of an experiment. Everything here stays behind
+`experimental-virtual-package-plugins`, and moving the trait down later is mechanical.
 
 ### Plugin Interface
 
