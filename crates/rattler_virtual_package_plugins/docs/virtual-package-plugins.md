@@ -22,7 +22,7 @@ beyond the feature flag itself.
 | Contract check of output against the registration | Implemented |
 | `SourcedVirtualPackage` result type, carrying a `BuiltIn` or `Plugin` source | Implemented |
 | `rattler virtual-packages -c <channel> [--detect]` | Implemented |
-| Resolution per view (channel + its `base` chain) | Implemented -- derived overrides base; independent channels do not compete |
+| Resolution per view (channel + its CEP-42 relations) | Implemented -- `base` and `overrides` both in scope, CEP-42 priority decides |
 | Running a plugin out of an existing environment, activated | Implemented |
 | Detection result cache | Implemented |
 | Plugin environment creation | Implemented |
@@ -617,20 +617,39 @@ plugin wins happens a layer up, in `resolve`.
 
 ### Views, and Resolution Within Them
 
-A **view** is one channel together with every channel it reaches through a CEP-42 `base` chain. It
-is the scope a virtual package lives in, and it is what `resolve::resolve_views` resolves: one
-result per view, never one global answer.
+A **view** is one channel together with every channel CEP-42 relates it to. It is the scope a
+virtual package lives in, and it is what `resolve::resolve_views` resolves: one result per view,
+never one global answer.
 
-**Independent channels do not compete.** Two channels with no `base` edge between them may each
-register a plugin for `__rocm`, and both answer -- each within its own view. There is no contest,
-no loser, and nothing consults the order the channels were listed in. This is what carrying the
-source on each virtual package buys: two `__rocm`s can coexist because each records which channel
-it answers for.
+**Unrelated channels do not compete.** Two channels with no relation between them may each register
+a plugin for `__rocm`, and both answer -- each within its own view. A channel outside the chain
+cannot say anything about the packages this one serves, so by definition it contributes nothing
+here. There is no contest, no loser, and nothing consults the order the channels were listed in.
+This is what carrying the source on each virtual package buys: two `__rocm`s can coexist because
+each records which channel it answers for.
 
-**Inside a view, the derived channel overrides its base.** That is what deriving from a channel
-means: a private channel declaring `base: conda-forge` may replace what conda-forge speaks for. The
-chain runs most-derived first and the first claimant along it wins, so the result does not depend on
-the order the channels were given on the command line.
+**Inside a view, CEP-42's priority decides**, and both of its relations are followed:
+
+| Relation | Brings into scope | Who wins a contested name |
+| --- | --- | --- |
+| `base: X` | X and its chain | **X** -- a base is higher priority than the channel declaring it |
+| `overrides: X` | X and its chain | **the declaring channel** -- it supersedes what it overrides |
+
+Both pull a channel in whether or not the user listed it. CEP-42's own example makes that explicit
+for `overrides`: `conda install -c conda-forge/label/rc some-package` resolves to the label channel
+*and* `conda-forge`, because "for packages that the label does not provide, the main channel serves
+as a fallback". A channel whose packages a solve will see must be a channel whose virtual packages
+it can see too, or a package from the fallback would depend on a name nothing provides.
+
+The chain is therefore built in the order CEP-42 spells out -- bases ahead of the channel declaring
+them, overridden channels behind it -- and the first claimant along it wins. A channel declaring
+`base: conda-forge` and `overrides: my-hotfixes` yields `[conda-forge, itself, my-hotfixes]`.
+
+**Overriding an upstream virtual package means declaring `overrides`, not `base`.** These say
+opposite things about priority, and the difference is the whole point of having two relations: a
+channel that builds *on* conda-forge defers to it, while one that supersedes conda-forge outranks
+it. Virtual packages follow the same direction as packages rather than inventing their own, so
+there is one rule to learn.
 
 Three further things, each deliberate:
 
@@ -644,8 +663,8 @@ Detection fails rather than guessing, before any of that channel's plugins runs.
 
 **A plugin can lose one name and keep another.** It still runs, for what it won, and it is still
 held to *everything* its channel registered it for: the contract is between the plugin and its
-channel, and losing `__cuda` to a channel deriving from it does not excuse the plugin from giving a
-verdict. The verdict is discarded rather than never asked for. A plugin that loses every name is not
+channel, and losing `__cuda` to a higher-priority channel in the view does not excuse the plugin
+from giving a verdict. The verdict is discarded rather than never asked for. A plugin that loses every name is not
 run at all, but is still returned in `ResolvedView::shadowed`, so a caller can say a registration was
 skipped and which channel took it.
 
@@ -776,8 +795,9 @@ the arrangement that motivated grouping in the first place: one driver connectio
    record first.
 4. **No version constraints in the registration.** Bare package name, latest version.
 5. **The gateway reports, `resolve` decides.** Registrations come back per subdir with duplicates
-   intact. Resolution is per view: a derived channel overrides its base, and channels with no `base`
-   relationship never compete because they are separate views.
+   intact. Resolution is per view -- a channel plus everything CEP-42 relates it to -- and within a
+   view the CEP's own priority decides: a `base` outranks the channel declaring it, a channel
+   outranks what it `overrides`. Unrelated channels never compete, being separate views.
 6. **Plugin identity is (channel, package name)** for conflict resolution, and a hash over the whole
    solved plugin environment for caching, so it changes when a dependency does.
 7. **The report is one JSON object keyed by virtual package name**, with `null` for absent. Absence
@@ -936,8 +956,9 @@ anything, rather than running each channel's registrations independently.
 **Superseded since.** Highest-priority-channel-wins was the wrong frame: it made two channels with
 no relationship to each other fight over a name, with list order picking the winner. Channels are
 independent, and each sees its own plugins, so resolution is now per *view* -- a channel plus its
-`base` chain. Inside a view the derived channel overrides its base; across views nothing competes.
-See *Views, and Resolution Within Them* above. Whether a plugin-provided
+CEP-42 relations. Inside a view the CEP's priority decides -- a `base` outranks the channel
+declaring it, and a channel outranks what it `overrides` -- while across views nothing competes.
+An earlier attempt had the `base` direction backwards; see *Views, and Resolution Within Them*. Whether a plugin-provided
 name may shadow a *built-in* one is a separate question and stays open (see below).
 
 ### 4. The one-second timeout -- done

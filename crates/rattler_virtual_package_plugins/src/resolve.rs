@@ -7,14 +7,18 @@
 //!
 //! Two consequences follow, and both are the point.
 //!
-//! **Independent channels never compete.** Two channels with no `base` edge
-//! between them may each register a plugin for `__rocm`, and both answer -- each
-//! within its own view. There is no contest to arbitrate and no loser, so
-//! nothing here consults the order the channels were listed in.
+//! **Unrelated channels never compete.** Two channels with no relation between
+//! them may each register a plugin for `__rocm`, and both answer -- each within
+//! its own view. A channel outside the chain cannot say anything about the
+//! packages this one serves, so it contributes nothing, and nothing here
+//! consults the order the channels were listed in.
 //!
-//! **Inside a view, the derived channel wins.** A channel that builds on another
-//! may override what its base speaks for; that is what deriving from it means.
-//! The chain runs most-derived first, so the first claimant along it wins.
+//! **Inside a view, CEP-42's priority decides.** The chain is built in the
+//! order that CEP defines -- bases ahead of the channel declaring them,
+//! overridden channels behind it -- and the first claimant along it wins. A
+//! channel wanting to redefine a virtual package its upstream speaks for
+//! declares `overrides`, which is the relation that means "I outrank that
+//! channel"; `base` means the opposite.
 //!
 //! Two plugins in *one* channel claiming the same virtual package is neither. It
 //! is a channel contradicting itself, with nothing to break the tie, so it is an
@@ -36,63 +40,112 @@ use rattler_repodata_gateway::{
 /// What one channel registered, once its subdirs have been folded together.
 type ChannelPlugins = IndexMap<PackageName, BTreeSet<PackageName>>;
 
-/// One channel and everything it inherits virtual packages from.
+/// One channel and every channel related to it, in priority order.
 ///
-/// The scope a virtual package is resolved in. Views do not interact: a name
-/// claimed in one says nothing about the same name in another.
+/// The scope a virtual package is resolved in. A channel outside this chain
+/// cannot answer anything about the packages this one serves, so it contributes
+/// nothing here; views over unrelated channels do not interact at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelView {
     /// The channel this view belongs to.
     pub channel: ChannelUrl,
 
-    /// `channel` first, then each `base` in turn, most derived to least. A
-    /// claim earlier in the chain overrides the same claim later in it.
+    /// Every channel in scope, **highest priority first**, as CEP-42 orders
+    /// them. A claim earlier in the chain wins over the same claim later in it.
     pub chain: Vec<ChannelUrl>,
 }
 
-/// The chain of channels `channel` inherits virtual packages from.
+/// The channels in scope for `channel`, in CEP-42 priority order.
 ///
-/// Only `base` is followed. It names the channel the declaring one builds on,
-/// so that channel's virtual packages are in scope; an `overrides` edge points
-/// the other way, at a channel being superseded.
+/// Both relations are followed, and their directions are the CEP's:
+///
+/// - **`base`** names a channel the declaring one builds upon, which has
+///   *higher* priority. Bases are walked transitively and end up ahead of the
+///   declaring channel.
+/// - **`overrides`** names a channel the declaring one supersedes, which has
+///   *lower* priority. Overridden channels are walked transitively and end up
+///   behind it.
+///
+/// So a channel declaring `base: conda-forge` and `overrides: my-hotfixes`
+/// yields `[conda-forge, itself, my-hotfixes]`, which is the order CEP-42 spells
+/// out. A channel that wants to redefine a virtual package its upstream already
+/// speaks for declares `overrides`, not `base`: `base` means the upstream wins.
 ///
 /// References resolve through [`resolve_channel_relation`], so a reference the
 /// gateway would refuse is skipped here too, and one already in the chain ends
-/// the walk, which terminates a `base` cycle. The depth cap is CEP-42's own
+/// that walk, which terminates a cycle. The depth cap is CEP-42's own
 /// [`DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH`].
 pub async fn channel_view(
     gateway: &Gateway,
     channel: &Channel,
     platform: Platform,
 ) -> Result<ChannelView, GatewayError> {
-    let mut chain = vec![channel.base_url.clone()];
     let mut seen = BTreeSet::from([channel.base_url.clone()]);
+    let higher = walk(gateway, channel, platform, &mut seen, Relation::Base).await?;
+    let lower = walk(gateway, channel, platform, &mut seen, Relation::Overrides).await?;
 
-    while chain.len() <= DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH {
-        let declaring = chain.last().expect("seeded above").clone();
+    // Bases are higher priority than the channel that declares them, so they
+    // come first, nearest last; overridden channels are lower, so they follow.
+    let chain = higher
+        .into_iter()
+        .rev()
+        .chain([channel.base_url.clone()])
+        .chain(lower)
+        .collect();
+
+    Ok(ChannelView {
+        channel: channel.base_url.clone(),
+        chain,
+    })
+}
+
+/// Which CEP-42 edge to follow.
+#[derive(Clone, Copy)]
+enum Relation {
+    /// Higher priority than the channel declaring it.
+    Base,
+    /// Lower priority than the channel declaring it.
+    Overrides,
+}
+
+/// Follows one relation transitively, nearest first.
+async fn walk(
+    gateway: &Gateway,
+    from: &Channel,
+    platform: Platform,
+    seen: &mut BTreeSet<ChannelUrl>,
+    relation: Relation,
+) -> Result<Vec<ChannelUrl>, GatewayError> {
+    let mut found: Vec<ChannelUrl> = Vec::new();
+
+    while found.len() <= DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH {
+        let declaring = found
+            .last()
+            .cloned()
+            .unwrap_or_else(|| from.base_url.clone());
         let Some(relations) = gateway
             .channel_relations(&Channel::from_url(declaring.clone()), platform)
             .await?
         else {
             break;
         };
-        let Some(base) = relations
-            .base
+        let reference = match relation {
+            Relation::Base => relations.base,
+            Relation::Overrides => relations.overrides,
+        };
+        let Some(next) = reference
             .as_deref()
-            .and_then(|base| resolve_channel_relation(&declaring, base))
+            .and_then(|reference| resolve_channel_relation(&declaring, reference))
         else {
             break;
         };
-        if !seen.insert(base.clone()) {
+        if !seen.insert(next.clone()) {
             break;
         }
-        chain.push(base);
+        found.push(next);
     }
 
-    Ok(ChannelView {
-        channel: channel.base_url.clone(),
-        chain,
-    })
+    Ok(found)
 }
 
 /// What a channel registered, and how much of it survived the contest.
@@ -125,9 +178,9 @@ pub struct ResolvedView {
     /// The channel whose view this is.
     pub channel: ChannelUrl,
 
-    /// The plugins to run, most-derived channel first and, within a channel, in
-    /// the order the channel listed them. Each provides at least one virtual
-    /// package.
+    /// The plugins to run, highest-priority channel first and, within a
+    /// channel, in the order the channel listed them. Each provides at least one
+    /// virtual package.
     pub plugins: Vec<ResolvedPlugin>,
 
     /// Registrations that are not run at all, because a channel nearer the head
@@ -342,13 +395,14 @@ mod tests {
         assert!(resolved[0].shadowed.is_empty());
     }
 
-    /// Inside a view, the channel that derives from another overrides it. The
-    /// base is listed *after* the derived channel in the chain, which is what
-    /// makes deriving mean something.
+    /// CEP-42: a `base` is *higher* priority than the channel declaring it, so
+    /// the base wins a contested name. `channel_view` puts it ahead in the
+    /// chain, and first-in-chain wins.
     #[test]
-    fn a_derived_channel_overrides_its_base() {
+    fn a_base_channel_outranks_the_channel_that_declares_it() {
         let resolved = resolve_views(
-            &[view(&["derived", "base"])],
+            // As channel_view builds it: base first, then the declaring channel.
+            &[view(&["base", "derived"])],
             [
                 subdir("base", Platform::Linux64, &[("a-detect", &["__cuda"])]),
                 subdir("derived", Platform::Linux64, &[("b-detect", &["__cuda"])]),
@@ -356,16 +410,37 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved[0].plugins.len(), 1, "the base must not also run");
-        assert_eq!(resolved[0].plugins[0].channel, channel("derived"));
+        assert_eq!(resolved[0].plugins.len(), 1, "the loser must not run");
+        assert_eq!(resolved[0].plugins[0].channel, channel("base"));
 
         assert_eq!(resolved[0].shadowed.len(), 1);
-        assert_eq!(resolved[0].shadowed[0].channel, channel("base"));
+        assert_eq!(resolved[0].shadowed[0].channel, channel("derived"));
         assert_eq!(
             resolved[0].shadowed[0].shadowed_by.get(&name("__cuda")),
-            Some(&channel("derived")),
+            Some(&channel("base")),
             "a shadowed registration has to say who took it"
         );
+    }
+
+    /// CEP-42: `overrides` points at a channel of *lower* priority, so the
+    /// declaring channel wins. This is the relation a channel uses to redefine
+    /// a virtual package its upstream already speaks for.
+    #[test]
+    fn a_channel_outranks_what_it_overrides() {
+        let resolved = resolve_views(
+            // As channel_view builds it: the declaring channel, then what it
+            // overrides.
+            &[view(&["mine", "upstream"])],
+            [
+                subdir("upstream", Platform::Linux64, &[("a-detect", &["__cuda"])]),
+                subdir("mine", Platform::Linux64, &[("b-detect", &["__cuda"])]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].plugins.len(), 1);
+        assert_eq!(resolved[0].plugins[0].channel, channel("mine"));
+        assert_eq!(resolved[0].shadowed[0].channel, channel("upstream"));
     }
 
     /// The rule this replaces: two channels with no relationship used to fight
@@ -418,16 +493,17 @@ mod tests {
         assert_eq!(provides(&resolved[0].plugins[0]), ["__rocm"]);
     }
 
-    /// A plugin can lose one name to its base and keep another. It still runs,
-    /// and is still held to everything its channel registered it for.
+    /// A plugin can lose one name to a higher-priority channel in its view and
+    /// keep another. It still runs, and is still held to everything its channel
+    /// registered it for.
     #[test]
     fn a_partially_shadowed_plugin_still_runs_for_what_it_wins() {
         let resolved = resolve_views(
-            &[view(&["derived", "base"])],
+            &[view(&["base", "derived"])],
             [
-                subdir("derived", Platform::Linux64, &[("a-detect", &["__rocm"])]),
+                subdir("base", Platform::Linux64, &[("a-detect", &["__rocm"])]),
                 subdir(
-                    "base",
+                    "derived",
                     Platform::Linux64,
                     &[("b-detect", &["__rocm", "__oneapi"])],
                 ),
