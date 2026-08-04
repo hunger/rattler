@@ -13,6 +13,7 @@
 //! - [`runner`] runs a plugin out of that environment.
 //! - [`protocol`] parses what a plugin writes to stdout.
 //! - [`contract`] checks those verdicts against what the channel registered.
+//! - [`demand`] works out which virtual packages a solve could ask for at all.
 //! - [`resolve`] decides which plugin speaks for a virtual package two channels
 //!   both claim.
 //! - [`factory`] is the common shape for anything that produces virtual
@@ -31,6 +32,8 @@ pub mod activation;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod contract;
 #[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod demand;
+#[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod detect;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod environment;
@@ -47,6 +50,8 @@ pub mod runner;
 pub use activation::{ActivationError, activated_environment};
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use contract::{ContractViolation, validate};
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use demand::virtual_packages_mentioned;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use detect::{
     DetectError, DetectOptions, Detection, DetectionTimings, detect_virtual_packages,

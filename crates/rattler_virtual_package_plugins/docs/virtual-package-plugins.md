@@ -44,6 +44,7 @@ beyond the feature flag itself.
 | Environment creation (`environment`) | `rattler_virtual_package_plugins` | done |
 | Orchestration (`detect`) | `rattler_virtual_package_plugins` | done |
 | `VirtualPackageFactory` and the built-in source (`factory`) | `rattler_virtual_package_plugins` | done |
+| Which virtual packages a solve could ask for (`demand`) | `rattler_virtual_package_plugins` | done |
 | Detection result cache | `rattler_cache` | done |
 
 `SourcedVirtualPackage` sits in `rattler_conda_types` rather than next to the code that produces it
