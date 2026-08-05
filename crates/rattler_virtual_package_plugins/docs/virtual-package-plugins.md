@@ -803,6 +803,18 @@ skipped and which channel took it.
 CEP 30 requires such a name to be *present* and does not dictate that the client's own detection is
 what fills it, so a channel that knows better about `__cuda` may say so.
 
+**`CONDA_OVERRIDE_*` for the built-ins is the factory's job.** `BuiltinVirtualPackages::from_env`
+holds the `VirtualPackageOverrides` and applies them in `resolve`, and it is the only thing that
+reads those variables -- callers ask the factory for virtual packages and get overridden ones. The
+CEP 30 machinery itself is unchanged and still lives in `rattler_virtual_packages`, since its
+per-name rules (`__archspec` sets a build string, `CONDA_OVERRIDE_UNIX` must do nothing, the
+platform-gated ones) are the CEP's and not ours to restate.
+
+`rattler virtual-packages` used to detect the built-ins itself, with its own
+`VirtualPackageOverrides::from_env()`, and then the factory detected them a second time for the
+views. Both are now one call: overriding a name changes the top-level listing and what every view
+offers, because they are the same set rather than two that happen to agree.
+
 `resolve_channel_relation` is exported so a caller resolving a CEP-42 `base`/`overrides` reference
 outside a query resolves it the same way the query path does. That validation stops malicious metadata
 from pointing at attacker-controlled URLs, so a second implementation would be a place for the two to

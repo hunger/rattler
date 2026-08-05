@@ -3,6 +3,7 @@ use indexmap::IndexMap;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 use itertools::Itertools;
 use miette::IntoDiagnostic;
+#[cfg(not(feature = "experimental-virtual-package-plugins"))]
 use rattler_conda_types::GenericVirtualPackage;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 use rattler_conda_types::{Channel, ChannelConfig, PackageName, Platform};
@@ -12,7 +13,6 @@ use rattler_repodata_gateway::Gateway;
 /// needs the same list to say what its built-in factory speaks for.
 #[cfg(feature = "experimental-virtual-package-plugins")]
 use rattler_virtual_package_plugins::{STANDARDIZED_VIRTUAL_PACKAGES, channel_view};
-use rattler_virtual_packages::VirtualPackageOverrides;
 
 /// Print detected virtual packages.
 #[derive(Debug, clap::Parser)]
@@ -52,30 +52,55 @@ pub struct Opt {
 }
 
 pub async fn virtual_packages(opt: Opt, offline: bool) -> miette::Result<()> {
-    let virtual_packages =
-        rattler_virtual_packages::VirtualPackage::detect(&VirtualPackageOverrides::from_env())
-            .into_diagnostic()?;
-    for package in virtual_packages {
-        println!("{}", GenericVirtualPackage::from(package.clone()));
-    }
-
     #[cfg(feature = "experimental-virtual-package-plugins")]
-    if opt.detect {
-        let timeout = opt.plugin_timeout.map_or_else(
-            rattler_virtual_package_plugins::RunTimeout::default,
-            |seconds| {
-                rattler_virtual_package_plugins::RunTimeout::new(std::time::Duration::from_secs(
-                    seconds,
-                ))
-            },
-        );
-        detect_plugins(&opt.channels, &opt.platforms, offline, timeout, opt.timings).await?;
-    } else {
-        print_plugins(&opt.channels, &opt.platforms, offline).await?;
+    {
+        use rattler_virtual_package_plugins::{BuiltinVirtualPackages, VirtualPackageFactory};
+
+        // Detected once and passed on: the same set is printed here and offered
+        // to every view, and detecting can mean a driver query. The factory is
+        // the only thing that reads `CONDA_OVERRIDE_*` for these.
+        let built_in = BuiltinVirtualPackages::from_env()
+            .resolve()
+            .await
+            .map_err(|err| miette::miette!(err))?;
+        for detected in &built_in {
+            println!("{}", detected.package);
+        }
+
+        if opt.detect {
+            let timeout = opt.plugin_timeout.map_or_else(
+                rattler_virtual_package_plugins::RunTimeout::default,
+                |seconds| {
+                    rattler_virtual_package_plugins::RunTimeout::new(
+                        std::time::Duration::from_secs(seconds),
+                    )
+                },
+            );
+            detect_plugins(
+                &opt.channels,
+                &opt.platforms,
+                offline,
+                timeout,
+                opt.timings,
+                &built_in,
+            )
+            .await?;
+        } else {
+            print_plugins(&opt.channels, &opt.platforms, offline).await?;
+        }
     }
 
     #[cfg(not(feature = "experimental-virtual-package-plugins"))]
-    let _ = (opt, offline);
+    {
+        let _ = (opt, offline);
+        let detected = rattler_virtual_packages::VirtualPackage::detect(
+            &rattler_virtual_packages::VirtualPackageOverrides::from_env(),
+        )
+        .into_diagnostic()?;
+        for package in detected {
+            println!("{}", GenericVirtualPackage::from(package));
+        }
+    }
 
     Ok(())
 }
@@ -316,6 +341,7 @@ async fn detect_plugins(
     offline: bool,
     timeout: rattler_virtual_package_plugins::RunTimeout,
     show_timings: bool,
+    built_in: &[rattler_conda_types::SourcedVirtualPackage],
 ) -> miette::Result<()> {
     use std::env;
 
@@ -325,8 +351,7 @@ async fn detect_plugins(
     };
     use rattler_repodata_gateway::SubdirVirtualPackagePlugins;
     use rattler_virtual_package_plugins::{
-        BuiltinVirtualPackages, DetectOptions, PluginContext, VirtualPackageFactory, combine,
-        detect_virtual_packages, resolve_views,
+        DetectOptions, PluginContext, combine, detect_virtual_packages, resolve_views,
     };
 
     if channels.is_empty() {
@@ -411,15 +436,6 @@ async fn detect_plugins(
         now,
     };
 
-    // The client's own virtual packages are in every view, per CEP 30. Resolved
-    // once: they do not vary by channel, and detecting them can mean a driver
-    // query.
-    let builtins = BuiltinVirtualPackages::from_env();
-    let built_in = builtins
-        .resolve()
-        .await
-        .map_err(|err| miette::miette!(err))?;
-
     for view in &resolved_views {
         if view.plugins.is_empty() && view.shadowed.is_empty() {
             continue;
@@ -492,7 +508,7 @@ async fn detect_plugins(
 
         // `combine` is what keeps a name CEP 30 mandates from vanishing when a
         // plugin claims it and comes back empty.
-        for detected in combine(&built_in, produced)
+        for detected in combine(built_in, produced)
             .into_iter()
             .filter(|detected| detected.source.is_built_in())
         {
