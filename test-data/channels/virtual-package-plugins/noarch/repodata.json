@@ -9,12 +9,58 @@
       ],
       "rocm-detect": [
         "__rocm"
+      ],
+      "change-me-detect": [
+        "__change_me"
       ]
     }
   },
   "packages.conda": {},
   "repodata_version": 2,
   "packages": {
+    "change-me-detect-1.0.0-h0000000_0.tar.bz2": {
+      "build": "h0000000_0",
+      "build_number": 0,
+      "depends": [],
+      "name": "change-me-detect",
+      "noarch": "generic",
+      "subdir": "noarch",
+      "timestamp": 1700000000000,
+      "version": "1.0.0",
+      "md5": "ca21fb70a1289c9722060696637ef495",
+      "sha256": "baecf4e0bf925c2f2f12c98284fcae8594d9f6a5db3ceb3020e8dbd33e9ec85f",
+      "size": 1015
+    },
+    "change-me-probe-1.0.0-even.tar.bz2": {
+      "build": "even",
+      "build_number": 0,
+      "depends": [
+        "__change_me ==0"
+      ],
+      "name": "change-me-probe",
+      "noarch": "generic",
+      "subdir": "noarch",
+      "timestamp": 1700000000000,
+      "version": "1.0.0",
+      "md5": "889bebbfdd4dbf06c832b8f199b3da67",
+      "sha256": "fe01d7999dc221d89cc14e2ca54a01b94caa8d13fb009db1da0ff0fef54d5bc6",
+      "size": 675
+    },
+    "change-me-probe-1.0.0-odd.tar.bz2": {
+      "build": "odd",
+      "build_number": 0,
+      "depends": [
+        "__change_me ==1"
+      ],
+      "name": "change-me-probe",
+      "noarch": "generic",
+      "subdir": "noarch",
+      "timestamp": 1700000000000,
+      "version": "1.0.0",
+      "md5": "ab279128587dfa8a3de18a8e03f891a4",
+      "sha256": "538f7631f761cbc2e4c7ebbdb442b3e3841a7877846746f2ca55c0b6a7d81f7d",
+      "size": 666
+    },
     "foobar-detect-1.0.0-h0000000_0.tar.bz2": {
       "build": "h0000000_0",
       "build_number": 0,

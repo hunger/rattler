@@ -941,6 +941,27 @@ Local fixtures to point it at, since no channel publishes the field yet:
   The script checks nothing itself -- it cannot, since detection is over by the time it runs. It
   reports a decision the solver already made, which is what makes it a usable check of the plugin
   path end to end rather than of the script's own environment.
+- `change-me-detect` registers `__change_me` and answers **differently every minute**: `0=even` on
+  even minutes, `1=odd` on odd ones, with `ttl_seconds: 0` so no answer is ever cached. Nothing else
+  in this channel changes on its own, so this is what a re-detection, a cache expiry or an override
+  can be watched against. `change-me-probe` ships an `even` and an `odd` build needing
+  `__change_me ==0` and `==1`; unlike `foobar-probe` they are mutually exclusive rather than ranked,
+  so exactly one is solvable at any moment and which one flips as the clock does:
+
+  ```console
+  $ rattler create -c ./test-data/channels/virtual-package-plugins -p /tmp/cm change-me-probe
+    - __change_me=1=odd
+  + change-me-probe 1.0.0 odd
+  $ /tmp/cm/bin/change-me-probe
+  __change_me was 1=odd at solve time.
+
+  # a minute later, with no other change:
+  + change-me-probe 1.0.0 even
+  __change_me was 0=even at solve time.
+  ```
+
+  This is the fixture that shows the whole chain in one command: the plugin runs, the solver sees a
+  name no client can detect, and a *different package* is installed as a result.
 
 All of this is behind the `experimental-virtual-package-plugins` feature. With the feature off the
 gateway's public API and its serialized output are unchanged.

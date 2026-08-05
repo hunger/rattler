@@ -26,6 +26,8 @@ from pathlib import Path
 CHANNEL = Path(__file__).resolve().parent
 PLUGIN = "foobar-detect"
 PROBE = "foobar-probe"
+CHANGING = "change-me-detect"
+CHANGING_PROBE = "change-me-probe"
 VERSION = "1.0.0"
 
 # Fixed so the archives are byte-for-byte reproducible.
@@ -94,6 +96,93 @@ def plugin_package() -> Package:
         depends=(),
         files=scripts(PLUGIN, PLUGIN_PREAMBLE, json.dumps(REPORT)),
     )
+
+
+def changing_plugin_package() -> Package:
+    """A plugin whose verdict changes with the clock, for watching a re-detect.
+
+    Every other minute it reports `__change_me` as `0=even`, and in between as
+    `1=odd`. Nothing else in this channel changes on its own, so this is what a
+    cache expiry, a re-solve, or an override can be observed against.
+
+    Its `ttl_seconds` is `0`, which makes each cache entry expire the instant it
+    is written: a plugin that answers differently every minute must not have an
+    answer kept for the default hour.
+
+    `date +%M` is zero-padded, and a leading zero would make `08` an invalid
+    octal number in `$(( ))`, so it is stripped before the arithmetic. The batch
+    file takes the last digit instead, which has the same parity and cannot be
+    read as octal either.
+    """
+    report = json.dumps(
+        {
+            "virtual_packages": {
+                "__change_me": {"version": "%s", "build_string": "%s"}
+            },
+            "cache": {"ttl_seconds": 0},
+        }
+    )
+    comment = (
+        "Test fixture: reports __change_me as 0=even on even minutes and 1=odd on "
+        "odd ones, so a re-detection has something to show."
+    )
+    return Package(
+        name=CHANGING,
+        build_string="h0000000_0",
+        build_number=0,
+        depends=(),
+        files={
+            f"bin/{CHANGING}": (
+                "#!/bin/sh\n"
+                f"# {comment}\n"
+                "minute=$(date +%M)\n"
+                "minute=${minute#0}\n"
+                '[ -n "$minute" ] || minute=0\n'
+                "if [ $(( minute % 2 )) -eq 0 ]; then\n"
+                f"    printf '%s\\n' '{report % ('0', 'even')}'\n"
+                "else\n"
+                f"    printf '%s\\n' '{report % ('1', 'odd')}'\n"
+                "fi\n"
+                "exit 0\n"
+            ),
+            f"Scripts/{CHANGING}.bat": (
+                "@echo off\r\n"
+                f"REM {comment}\r\n"
+                'for /f "tokens=2 delims=:" %%m in ("%TIME%") do set MINUTE=%%m\r\n'
+                "set /a PARITY=%MINUTE:~-1% %% 2\r\n"
+                "if %PARITY%==0 (\r\n"
+                f"    echo {report % ('0', 'even')}\r\n"
+                ") else (\r\n"
+                f"    echo {report % ('1', 'odd')}\r\n"
+                ")\r\n"
+                "exit /b 0\r\n"
+            ),
+        },
+    )
+
+
+def changing_probe_packages() -> list[Package]:
+    """Two flavours of one package, one installable per state of `__change_me`.
+
+    Unlike `foobar-probe` these are mutually exclusive rather than ranked: `even`
+    needs `__change_me ==0` and `odd` needs `==1`, so exactly one of them can be
+    solved for at any moment and which one it is flips every minute. Installing
+    `change-me-probe` and running it therefore shows the state the *solver* saw.
+    """
+    return [
+        Package(
+            name=CHANGING_PROBE,
+            build_string=state,
+            build_number=0,
+            depends=(f"__change_me =={version}",),
+            files=scripts(
+                CHANGING_PROBE,
+                f"Test fixture: the {state} flavour of {CHANGING_PROBE}.",
+                f"__change_me was {version}={state} at solve time.",
+            ),
+        )
+        for version, state in (("0", "even"), ("1", "odd"))
+    ]
 
 
 def probe_packages() -> list[Package]:
@@ -190,7 +279,12 @@ def write(package: Package) -> dict[str, object]:
 
 
 def main() -> None:
-    packages = [plugin_package(), *probe_packages()]
+    packages = [
+        plugin_package(),
+        *probe_packages(),
+        changing_plugin_package(),
+        *changing_probe_packages(),
+    ]
     entries = {package.archive_name: write(package) for package in packages}
 
     repodata_path = CHANNEL / "noarch" / "repodata.json"

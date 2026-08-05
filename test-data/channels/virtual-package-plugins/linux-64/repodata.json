@@ -9,6 +9,9 @@
       ],
       "rocm-detect": [
         "__rocm"
+      ],
+      "change-me-detect": [
+        "__change_me"
       ]
     }
   },
