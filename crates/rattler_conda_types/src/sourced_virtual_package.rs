@@ -54,6 +54,21 @@ pub enum VirtualPackageSource {
         #[serde_as(as = "SerializableHash::<rattler_digest::Sha256>")]
         environment: Sha256Hash,
     },
+
+    /// Taken from a `CONDA_OVERRIDE_*` variable instead of being detected.
+    ///
+    /// Visible exactly where the plugin's own verdict would have been, because
+    /// it stands in for that verdict: the plugin was not run for this name. It is
+    /// a separate source rather than a [`Plugin`](Self::Plugin) with a made-up
+    /// hash, since there is no environment to point at and a consumer recording
+    /// provenance must not be told a plugin produced this.
+    Overridden {
+        /// The channel whose plugin would have answered.
+        channel: ChannelUrl,
+
+        /// The plugin that would have been run.
+        plugin: PackageName,
+    },
 }
 
 impl VirtualPackageSource {
@@ -61,7 +76,7 @@ impl VirtualPackageSource {
     pub fn channel(&self) -> Option<&ChannelUrl> {
         match self {
             Self::BuiltIn => None,
-            Self::Plugin { channel, .. } => Some(channel),
+            Self::Plugin { channel, .. } | Self::Overridden { channel, .. } => Some(channel),
         }
     }
 
@@ -73,7 +88,7 @@ impl VirtualPackageSource {
     pub fn is_built_in(&self) -> bool {
         match self {
             Self::BuiltIn => true,
-            Self::Plugin { .. } => false,
+            Self::Plugin { .. } | Self::Overridden { .. } => false,
         }
     }
 }

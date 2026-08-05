@@ -21,7 +21,10 @@
 //! specializations `provides` is what the source claims and `resolve` is what
 //! turned out to be there: names reported absent simply do not come back.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use async_trait::async_trait;
 use rattler_cache::{
@@ -37,6 +40,7 @@ use rattler_virtual_packages::{
 
 use crate::{
     detect::{DetectError, DetectOptions, detect_virtual_packages},
+    overrides::{self, Overridden, OverrideError, PluginOverrides},
     resolve::ResolvedPlugin,
     runner::RunTimeout,
 };
@@ -72,6 +76,13 @@ pub enum FactoryError {
     /// variant and would otherwise weigh down every `Result` in this module.
     #[error(transparent)]
     Plugin(#[from] Box<DetectError>),
+
+    /// A `CONDA_OVERRIDE_*` variable was set to something unusable.
+    ///
+    /// An error rather than a warning: the user asked for a specific value, and
+    /// carrying on with the detected one would look like the override worked.
+    #[error(transparent)]
+    Override(#[from] Box<OverrideError>),
 }
 
 /// The virtual packages this client detects itself.
@@ -190,6 +201,10 @@ pub struct PluginContext<'a> {
     /// The current time in seconds since the Unix epoch, for cache expiry. One
     /// value for a whole run so every plugin agrees on what now is.
     pub now: i64,
+
+    /// What the environment says a plugin's virtual packages are, standing in for
+    /// running it. One snapshot for a whole run, for the same reason as `now`.
+    pub overrides: &'a PluginOverrides,
 }
 
 impl<'a> PluginVirtualPackages<'a> {
@@ -225,6 +240,20 @@ impl VirtualPackageFactory for PluginVirtualPackages<'_> {
     }
 
     async fn resolve(&self) -> Result<Vec<SourcedVirtualPackage>, FactoryError> {
+        let overridden = self.overridden()?;
+
+        // Every name this plugin is on offer for is spoken for by the
+        // environment, so running it could not change the answer -- and running
+        // it means solving an environment, installing it and starting a process.
+        // Skipping that is most of the point of being able to override at all.
+        if overridden.len() == self.resolved.provides.len() {
+            tracing::debug!(
+                "not running the plugin '{}': every virtual package it provides is overridden",
+                self.resolved.plugin.as_source()
+            );
+            return Ok(self.present(overridden));
+        }
+
         let detection = detect_virtual_packages(DetectOptions {
             gateway: self.context.gateway,
             package_cache: self.context.package_cache,
@@ -244,11 +273,40 @@ impl VirtualPackageFactory for PluginVirtualPackages<'_> {
         // only what it won is on offer. The rest is dropped here rather than
         // never asked for: the contract is between the plugin and its channel,
         // so it still had to give a verdict.
-        Ok(detection
+        //
+        // An overridden name drops out too, whatever the plugin said about it:
+        // the plugin ran because some *other* name needed it.
+        let detected: Vec<_> = detection
             .virtual_packages
             .into_iter()
             .filter(|detected| self.resolved.provides.contains(&detected.package.name))
+            .filter(|detected| !overridden.contains_key(&detected.package.name))
+            .collect();
+
+        Ok(detected
+            .into_iter()
+            .chain(self.present(overridden))
             .collect())
+    }
+}
+
+impl PluginVirtualPackages<'_> {
+    /// What the environment says about the names this plugin is on offer for.
+    ///
+    /// Absent from the map means the environment said nothing; present but
+    /// [`Overridden::Absent`] means it said the name is not there, which is not
+    /// the same thing and is why both are kept.
+    fn overridden(&self) -> Result<BTreeMap<PackageName, Overridden>, FactoryError> {
+        self.context
+            .overrides
+            .for_names(&self.resolved.provides, &self.resolved.channel)
+            .map_err(Box::new)
+            .map_err(FactoryError::Override)
+    }
+
+    /// The overrides that name a package, attributed to this plugin.
+    fn present(&self, overridden: BTreeMap<PackageName, Overridden>) -> Vec<SourcedVirtualPackage> {
+        overrides::sourced(overridden, &self.resolved.channel, &self.resolved.plugin)
     }
 }
 
@@ -577,5 +635,152 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A plugin registered by a channel that does not exist, so reaching the
+    /// gateway for it cannot succeed. Any test below that finishes therefore
+    /// proves the plugin was never run.
+    fn unreachable_plugin(provides: &[&str]) -> (ResolvedPlugin, Channel) {
+        let channel = Channel::from_url(
+            url::Url::parse("https://nothing.invalid/org/")
+                .expect("a valid url")
+                .clone(),
+        );
+        let resolved = ResolvedPlugin {
+            channel: channel.base_url.clone(),
+            plugin: PackageName::new_unchecked("foobar-detect"),
+            declared: provides
+                .iter()
+                .map(|name| PackageName::new_unchecked(*name))
+                .collect(),
+            provides: provides
+                .iter()
+                .map(|name| PackageName::new_unchecked(*name))
+                .collect(),
+            shadowed_by: BTreeMap::default(),
+        };
+        (resolved, channel)
+    }
+
+    fn overrides(variables: &[(&str, &str)]) -> PluginOverrides {
+        PluginOverrides::from_variables(
+            variables
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
+        )
+    }
+
+    /// Resolves `resolved` with `overrides`, through a context whose caches point
+    /// into `scratch`. Running the plugin would need the channel to exist.
+    async fn resolve_overridden(
+        provides: &[&str],
+        overrides: &PluginOverrides,
+    ) -> Result<Vec<SourcedVirtualPackage>, FactoryError> {
+        let scratch = tempfile::tempdir().expect("a temporary directory");
+        let gateway = Gateway::new();
+        let package_cache = PackageCache::new(scratch.path().join("packages"));
+        let detection_cache = VirtualPackagePluginCache::new(scratch.path().join("detections"));
+        let environment_root = scratch.path().join("envs");
+        let (resolved, channel) = unreachable_plugin(provides);
+
+        PluginVirtualPackages::new(
+            &resolved,
+            &channel,
+            PluginContext {
+                gateway: &gateway,
+                package_cache: &package_cache,
+                detection_cache: &detection_cache,
+                environment_root: &environment_root,
+                host_platform: Platform::current(),
+                timeout: RunTimeout::default(),
+                now: 1_000,
+                overrides,
+            },
+        )
+        .resolve()
+        .await
+    }
+
+    /// The saving that makes overriding a plugin worth having: detecting can mean
+    /// solving an environment, installing it and running a program, and an
+    /// override says none of that is needed.
+    #[tokio::test]
+    async fn a_fully_overridden_plugin_is_not_run() {
+        let resolved = resolve_overridden(
+            &["__foobar", "__foobar_arch"],
+            &overrides(&[
+                ("CONDA_OVERRIDE_FOOBAR", "1.2.3"),
+                ("CONDA_OVERRIDE_FOOBAR_ARCH", "0=gen4"),
+            ]),
+        )
+        .await
+        .expect("an overridden plugin resolves without being reachable");
+
+        let reported: Vec<_> = resolved
+            .iter()
+            .map(|detected| {
+                format!(
+                    "{}={}={}",
+                    detected.package.name.as_source(),
+                    detected.package.version,
+                    detected.package.build_string
+                )
+            })
+            .collect();
+        assert_eq!(reported, ["__foobar=1.2.3=0", "__foobar_arch=0=gen4"]);
+    }
+
+    /// An override stands in for a plugin's verdict, so it is visible exactly
+    /// where that verdict would have been -- but it must not claim a plugin
+    /// produced it, since no environment was ever built.
+    #[tokio::test]
+    async fn an_override_is_sourced_to_the_plugin_it_stands_in_for() {
+        let resolved = resolve_overridden(
+            &["__foobar"],
+            &overrides(&[("CONDA_OVERRIDE_FOOBAR", "1.2.3")]),
+        )
+        .await
+        .expect("an overridden plugin resolves");
+
+        let source = &resolved.first().expect("one virtual package").source;
+        assert!(
+            matches!(
+                source,
+                VirtualPackageSource::Overridden { channel, plugin }
+                    if channel.url().as_str() == "https://nothing.invalid/org/"
+                        && plugin.as_source() == "foobar-detect"
+            ),
+            "expected an overridden source naming the plugin, got: {source:?}"
+        );
+        assert!(!source.is_built_in(), "an override is not a built-in");
+    }
+
+    /// CEP 30 uses an empty value to mean the name is not there. The plugin still
+    /// must not run, and the name must not come back.
+    #[tokio::test]
+    async fn an_override_can_say_a_name_is_absent() {
+        let resolved =
+            resolve_overridden(&["__foobar"], &overrides(&[("CONDA_OVERRIDE_FOOBAR", "")]))
+                .await
+                .expect("an overridden plugin resolves");
+
+        assert!(
+            resolved.is_empty(),
+            "an absent override reports nothing, got: {resolved:?}"
+        );
+    }
+
+    /// A value that cannot be read is the user's mistake, and carrying on with
+    /// the detected one would look like the override took effect.
+    #[tokio::test]
+    async fn an_unusable_override_is_an_error() {
+        let error = resolve_overridden(
+            &["__foobar"],
+            &overrides(&[("CONDA_OVERRIDE_FOOBAR", "not a version")]),
+        )
+        .await
+        .expect_err("an unusable override must not be ignored");
+
+        assert!(matches!(error, FactoryError::Override(_)), "got: {error:?}");
     }
 }

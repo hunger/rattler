@@ -260,7 +260,8 @@ async fn a_plugin_factory_offers_only_what_the_plugin_won() {
 
     use rattler_cache::virtual_package_plugin_cache::VirtualPackagePluginCache;
     use rattler_virtual_package_plugins::{
-        PluginContext, PluginVirtualPackages, ResolvedPlugin, VirtualPackageFactory,
+        PluginContext, PluginOverrides, PluginVirtualPackages, ResolvedPlugin,
+        VirtualPackageFactory,
     };
 
     let cache = tempfile::tempdir().unwrap();
@@ -301,6 +302,7 @@ async fn a_plugin_factory_offers_only_what_the_plugin_won() {
         shadowed_by: std::collections::BTreeMap::default(),
     };
 
+    let overrides = PluginOverrides::default();
     let factory = PluginVirtualPackages::new(
         &resolved,
         &channel,
@@ -312,6 +314,7 @@ async fn a_plugin_factory_offers_only_what_the_plugin_won() {
             host_platform: platform,
             timeout: RunTimeout::default(),
             now: 1_000,
+            overrides: &overrides,
         },
     );
 

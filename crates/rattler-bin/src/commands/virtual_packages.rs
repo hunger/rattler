@@ -351,7 +351,8 @@ async fn detect_plugins(
     };
     use rattler_repodata_gateway::SubdirVirtualPackagePlugins;
     use rattler_virtual_package_plugins::{
-        DetectOptions, PluginContext, combine, detect_virtual_packages, resolve_views,
+        DetectOptions, PluginContext, PluginOverrides, combine, detect_virtual_packages, overrides,
+        resolve_views,
     };
 
     if channels.is_empty() {
@@ -426,6 +427,7 @@ async fn detect_plugins(
     let resolved_views =
         resolve_views(&views, registrations).map_err(|err| miette::miette!(err))?;
 
+    let overrides = PluginOverrides::from_env();
     let context = PluginContext {
         gateway: &gateway,
         package_cache: &package_cache,
@@ -434,6 +436,7 @@ async fn detect_plugins(
         host_platform: platform,
         timeout,
         now,
+        overrides: &overrides,
     };
 
     for view in &resolved_views {
@@ -462,6 +465,23 @@ async fn detect_plugins(
                 .iter()
                 .find(|channel| channel.base_url == resolved.channel)
                 .expect("a resolved plugin comes from a channel some view can see");
+
+            // An override stands in for the plugin's verdict. When it covers
+            // every name the plugin is on offer for, running it -- solving an
+            // environment, installing it, starting a process -- cannot change
+            // the answer.
+            let overridden = context
+                .overrides
+                .for_names(&resolved.provides, &resolved.channel)
+                .map_err(|err| miette::miette!(err))?;
+            if overridden.len() == resolved.provides.len() {
+                let stood_in_for =
+                    overrides::sourced(overridden, &resolved.channel, &resolved.plugin);
+                report_overridden(resolved, &stood_in_for);
+                produced.extend(stood_in_for);
+                continue;
+            }
+
             let detection = detect_virtual_packages(DetectOptions {
                 gateway: context.gateway,
                 package_cache: context.package_cache,
@@ -483,9 +503,15 @@ async fn detect_plugins(
                             .virtual_packages
                             .iter()
                             .filter(|detected| resolved.provides.contains(&detected.package.name))
+                            .filter(|detected| !overridden.contains_key(&detected.package.name))
                             .cloned(),
                     );
-                    report_detection(resolved, &detection, show_timings);
+                    report_detection(resolved, &detection, &overridden, show_timings);
+                    produced.extend(overrides::sourced(
+                        overridden,
+                        &resolved.channel,
+                        &resolved.plugin,
+                    ));
                 }
                 Err(err) => {
                     println!(
@@ -530,6 +556,10 @@ async fn detect_plugins(
 fn report_detection(
     resolved: &rattler_virtual_package_plugins::ResolvedPlugin,
     detection: &rattler_virtual_package_plugins::Detection,
+    overridden: &std::collections::BTreeMap<
+        PackageName,
+        rattler_virtual_package_plugins::Overridden,
+    >,
     show_timings: bool,
 ) {
     let source = if detection.from_cache {
@@ -568,8 +598,9 @@ fn report_detection(
         .virtual_packages
         .iter()
         .filter(|detected| resolved.provides.contains(&detected.package.name))
+        .filter(|detected| !overridden.contains_key(&detected.package.name))
         .collect();
-    if used.is_empty() {
+    if used.is_empty() && overridden.is_empty() {
         println!(
             "      {}",
             console::style(format!(
@@ -587,6 +618,20 @@ fn report_detection(
         println!("      {}", console::style(&detected.package).green());
     }
 
+    // Whatever the plugin said about an overridden name, the environment is what
+    // counts. Saying so beats printing a value the solver will not see.
+    for (name, overridden) in overridden {
+        let line = match overridden {
+            rattler_virtual_package_plugins::Overridden::Present(package) => {
+                format!("{package} (overridden)")
+            }
+            rattler_virtual_package_plugins::Overridden::Absent => {
+                format!("{} overridden to absent", name.as_source())
+            }
+        };
+        println!("      {}", console::style(line).yellow());
+    }
+
     // A verdict this plugin gave that another channel's plugin speaks for. It
     // still had to give one, and saying so beats a silently missing line.
     for (virtual_package, winner) in &resolved.shadowed_by {
@@ -597,6 +642,36 @@ fn report_detection(
                 virtual_package.as_source()
             ))
             .dim(),
+        );
+    }
+}
+
+/// Reports a registration that is not run because the environment already says
+/// what it would have reported.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+fn report_overridden(
+    resolved: &rattler_virtual_package_plugins::ResolvedPlugin,
+    stood_in_for: &[rattler_conda_types::SourcedVirtualPackage],
+) {
+    println!(
+        "  {} {} {}",
+        console::style(console::Emoji("⇄", "=")).yellow(),
+        console::style(resolved.plugin.as_source()).bold(),
+        console::style("(overridden, not run)").dim(),
+    );
+    for detected in stood_in_for {
+        println!("      {}", detected.package);
+    }
+    // A name overridden to absent is reported nowhere else, and silence would
+    // read as the plugin having found nothing rather than as an instruction.
+    for name in resolved
+        .provides
+        .iter()
+        .filter(|name| !stood_in_for.iter().any(|d| &&d.package.name == name))
+    {
+        println!(
+            "      {}",
+            console::style(format!("{} overridden to absent", name.as_source())).dim(),
         );
     }
 }

@@ -27,7 +27,8 @@ beyond the feature flag itself.
 | Detection result cache | Implemented |
 | Plugin environment creation | Implemented |
 | Detection end to end (orchestration) | Implemented |
-| Solver injection, `CONDA_OVERRIDE_*`, lockfile representation | Not implemented |
+| `CONDA_OVERRIDE_*` for built-ins and plugin virtual packages | Implemented -- general and channel-qualified forms; a fully overridden plugin is not run |
+| Solver injection, lockfile representation | Not implemented |
 | Trust / opt-in model | Open, blocks execution |
 | prefix.dev upload validation | Proposed, server side; nothing here depends on it |
 
@@ -814,6 +815,38 @@ platform-gated ones) are the CEP's and not ours to restate.
 `VirtualPackageOverrides::from_env()`, and then the factory detected them a second time for the
 views. Both are now one call: overriding a name changes the top-level listing and what every view
 offers, because they are the same set rather than two that happen to agree.
+
+**A plugin's virtual packages can be overridden too, and the reasons are stronger.** Overriding a
+built-in saves a cheap read of the running system. Overriding a plugin's saves solving an
+environment, installing it and running a program that talks to hardware -- and on a machine without
+that hardware there is otherwise no way to get the name at all. Two forms, the more specific
+winning:
+
+| Variable                             | Overrides                                                     |
+| ------------------------------------ | ------------------------------------------------------------- |
+| `CONDA_OVERRIDE_FOOBAR`              | `__foobar`, whichever channel speaks for it                    |
+| `CONDA_OVERRIDE_FOOBAR_CONDA_FORGE`  | `__foobar`, but only from the channel whose URL ends `conda-forge` |
+
+The value is a version, or `version=build_string` for a name like `__foobar_arch` whose capability
+is in the build string. An empty value means the name is *absent*, as CEP 30 uses it -- which is the
+only way to say "pretend this hardware is missing". A value that is not a version is an error rather
+than a warning: carrying on with the detected one would look like the override took effect.
+
+**When every name a plugin is on offer for is overridden, the plugin is not run.** That is the whole
+point; if it still ran, an override would only rewrite the answer after paying for it. When only
+some are overridden the plugin still runs, because the other names need it, and the overridden ones
+are dropped from what it reported.
+
+**The channel-qualified form names a channel by the last component of its base URL**, which is short
+enough to type and *not* unique -- a mirror of a channel ends in the same component, and a label
+(`conda-forge/label/rc`) is named by `rc`. That follows from CEP 26 defining channel identity as the
+base URL, with nothing shorter available: there is no channel id or UUID in repodata to key on. The
+ambiguity is the price of a usable variable name, and it is why the unqualified form exists.
+
+An override is not a plugin verdict and must not be recorded as one, so it carries
+`VirtualPackageSource::Overridden { channel, plugin }` rather than `Plugin`. There is no environment
+hash to point at, because no environment was built, and a consumer writing provenance into a lockfile
+would otherwise be told a plugin produced a value that came from a shell variable.
 
 `resolve_channel_relation` is exported so a caller resolving a CEP-42 `base`/`overrides` reference
 outside a query resolves it the same way the query path does. That validation stops malicious metadata

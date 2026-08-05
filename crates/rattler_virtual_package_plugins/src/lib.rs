@@ -40,6 +40,8 @@ pub mod environment;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod factory;
 #[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod overrides;
+#[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod protocol;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod resolve;
@@ -66,6 +68,8 @@ pub use factory::{
     BuiltinVirtualPackages, FactoryError, PluginContext, PluginVirtualPackages,
     STANDARDIZED_VIRTUAL_PACKAGES, VirtualPackageFactory, combine, resolve_needed,
 };
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use overrides::{Overridden, OverrideError, PluginOverrides};
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use protocol::{CachePolicy, Detected, PluginReport, ProtocolError, parse_report};
 #[cfg(feature = "experimental-virtual-package-plugins")]
