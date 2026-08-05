@@ -868,6 +868,22 @@ Local fixtures to point it at, since no channel publishes the field yet:
   `rocm-detect` and deliberately ships no package for it, which exercises that error path.
 - `-base` and `-derived` cover inheritance, and deliberately do register `__cuda` and `__glibc`, since
   provoking the shadowing warnings is what they are for.
+- The same channel ships `foobar-probe 1.0.0` twice: `with_foobar` depends on `__foobar >=1.0` and has
+  the higher build number, `without_foobar` depends on nothing. A solve takes the first whenever it
+  can and falls back to the second only when `__foobar` is missing, so which one lands says whether
+  the virtual package reached the solver. Both install a `foobar-probe` script that prints the
+  verdict, which makes it readable after the fact:
+
+  ```console
+  $ rattler create -c ./test-data/channels/virtual-package-plugins \
+      --virtual-package __foobar=1.2.3 --target-prefix /tmp/probe foobar-probe
+  $ /tmp/probe/bin/foobar-probe
+  __foobar WAS available at solve time (the "with_foobar" build was installable).
+  ```
+
+  The script checks nothing itself -- it cannot, since detection is over by the time it runs. It
+  reports a decision the solver already made, which is what makes it a usable check of the plugin
+  path end to end rather than of the script's own environment.
 
 All of this is behind the `experimental-virtual-package-plugins` feature. With the feature off the
 gateway's public API and its serialized output are unchanged.
@@ -1043,10 +1059,12 @@ more. One case is new: a plugin that exits zero having written nothing is now it
 than silence about every registered name, because writing the report to stderr by mistake is a
 mistake worth naming.
 
-The fixture plugin package is rebuilt from
+The fixture packages are rebuilt from
 `test-data/channels/virtual-package-plugins/regenerate.py`, which also updates the hashes in
-`info/paths.json` and `repodata.json`. It was hand-built before, and getting the protocol wrong in a
-binary fixture is expensive to notice.
+`info/paths.json` and `repodata.json`. They were hand-built before, and getting the protocol wrong in
+a binary fixture is expensive to notice. The archives are byte-for-byte reproducible -- fixed
+timestamps, modes and ownership -- so re-running it is a no-op unless a package's contents actually
+changed, and a diff in a `.tar.bz2` means something.
 
 ### 2. Rejecting unknown line kinds and unknown fields -- done
 

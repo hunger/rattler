@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Rebuild the `foobar-detect` plugin package and the repodata that indexes it.
+"""Rebuild this channel's fixture packages and the repodata that indexes them.
 
-The fixture is a real conda package, so changing what the plugin prints means
-rebuilding an archive and updating three hashes: the two in `info/paths.json`
-and the one in `noarch/repodata.json`. Doing that by hand is how a fixture ends
-up with a hash that no longer matches its contents.
+The fixtures are real conda packages, so changing what one of them prints means
+rebuilding an archive and updating the hashes that describe it: the ones in its
+own `info/paths.json` and the ones in `noarch/repodata.json`. Doing that by hand
+is how a fixture ends up with a hash that no longer matches its contents.
+
+Two kinds of package live here:
+
+- `foobar-detect`, the virtual package plugin this channel registers. It reports
+  fixed verdicts so detection can be exercised without the hardware.
+- `foobar-probe`, in two flavours, for checking by hand whether a virtual package
+  reached the solver. See `probe_packages`.
 
 Run it from anywhere; it writes only inside this directory.
 """
@@ -13,15 +20,15 @@ import hashlib
 import io
 import json
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path
 
 CHANNEL = Path(__file__).resolve().parent
-PACKAGE = "foobar-detect"
+PLUGIN = "foobar-detect"
+PROBE = "foobar-probe"
 VERSION = "1.0.0"
-BUILD_STRING = "h0000000_0"
-ARCHIVE = CHANNEL / "noarch" / f"{PACKAGE}-{VERSION}-{BUILD_STRING}.tar.bz2"
 
-# Fixed so the archive is byte-for-byte reproducible.
+# Fixed so the archives are byte-for-byte reproducible.
 TIMESTAMP = 1700000000
 
 REPORT = {
@@ -32,30 +39,106 @@ REPORT = {
     "cache": {"ttl_seconds": 3600},
 }
 
-PREAMBLE = (
+PLUGIN_PREAMBLE = (
     "Test fixture: reports fixed verdicts for the virtual packages this channel "
-    f"registers {PACKAGE} for, so detection can be exercised without the hardware. "
+    f"registers {PLUGIN} for, so detection can be exercised without the hardware. "
     "Real plugins inspect the system here."
 )
 
 
-def entry_points() -> dict[str, str]:
-    """The plugin itself, one script per platform, printing the same report."""
-    report = json.dumps(REPORT)
+@dataclass(frozen=True)
+class Package:
+    """One fixture package: a `noarch: generic` archive and its repodata entry."""
+
+    name: str
+    build_string: str
+    build_number: int
+    depends: tuple[str, ...]
+    files: dict[str, str]
+
+    @property
+    def archive_name(self) -> str:
+        return f"{self.name}-{VERSION}-{self.build_string}.tar.bz2"
+
+    def index(self) -> dict[str, object]:
+        return {
+            "build": self.build_string,
+            "build_number": self.build_number,
+            "depends": list(self.depends),
+            "name": self.name,
+            "noarch": "generic",
+            "subdir": "noarch",
+            "timestamp": TIMESTAMP * 1000,
+            "version": VERSION,
+        }
+
+
+def scripts(name: str, comment: str, message: str) -> dict[str, str]:
+    """One entry point per platform, both printing `message`."""
     return {
-        f"bin/{PACKAGE}": (
-            f"#!/bin/sh\n"
-            f"# {PREAMBLE}\n"
-            f"printf '%s\\n' '{report}'\n"
-            f"exit 0\n"
+        f"bin/{name}": (
+            f"#!/bin/sh\n# {comment}\nprintf '%s\\n' '{message}'\nexit 0\n"
         ),
-        f"Scripts/{PACKAGE}.bat": (
-            f"@echo off\r\n"
-            f"REM {PREAMBLE}\r\n"
-            f"echo {report}\r\n"
-            f"exit /b 0\r\n"
+        f"Scripts/{name}.bat": (
+            f"@echo off\r\nREM {comment}\r\necho {message}\r\nexit /b 0\r\n"
         ),
     }
+
+
+def plugin_package() -> Package:
+    """The virtual package plugin this channel registers."""
+    return Package(
+        name=PLUGIN,
+        build_string="h0000000_0",
+        build_number=0,
+        depends=(),
+        files=scripts(PLUGIN, PLUGIN_PREAMBLE, json.dumps(REPORT)),
+    )
+
+
+def probe_packages() -> list[Package]:
+    """Two flavours of one package, telling you which one the solver could take.
+
+    Both are `foobar-probe 1.0.0`. The only differences are that one depends on
+    `__foobar` and the other does not, and that the depending one has the higher
+    build number -- so a solver takes it whenever it can, and falls back to the
+    other only when `__foobar` is missing.
+
+    Running `foobar-probe` from the resulting environment therefore reports
+    whether the virtual package reached the solver. Which is the point: the
+    verdict is decided at solve time and merely read back afterwards, so it stays
+    true even though the script itself checks nothing.
+    """
+    common = (
+        f"Test fixture: one of the two {PROBE} builds. Which one a solve picks "
+        "depends on whether __foobar was offered to the solver."
+    )
+    return [
+        Package(
+            name=PROBE,
+            build_string="with_foobar",
+            build_number=1,
+            depends=("__foobar >=1.0",),
+            files=scripts(
+                PROBE,
+                common,
+                "__foobar WAS available at solve time "
+                '(the "with_foobar" build was installable).',
+            ),
+        ),
+        Package(
+            name=PROBE,
+            build_string="without_foobar",
+            build_number=0,
+            depends=(),
+            files=scripts(
+                PROBE,
+                common,
+                "__foobar was NOT available at solve time "
+                '(fell back to the "without_foobar" build).',
+            ),
+        ),
+    ]
 
 
 def sha256(payload: bytes) -> str:
@@ -77,21 +160,9 @@ def build_archive(files: dict[str, bytes]) -> bytes:
     return raw.getvalue()
 
 
-def index() -> dict[str, object]:
-    return {
-        "build": BUILD_STRING,
-        "build_number": 0,
-        "depends": [],
-        "name": PACKAGE,
-        "noarch": "generic",
-        "subdir": "noarch",
-        "timestamp": TIMESTAMP * 1000,
-        "version": VERSION,
-    }
-
-
-def main() -> None:
-    files = {name: body.encode() for name, body in entry_points().items()}
+def write(package: Package) -> dict[str, object]:
+    """Writes the archive and returns the repodata entry describing it."""
+    files = {name: body.encode() for name, body in package.files.items()}
     paths = {
         "paths": [
             {
@@ -104,22 +175,28 @@ def main() -> None:
         ],
         "paths_version": 1,
     }
-    files["info/index.json"] = (json.dumps(index(), indent=2) + "\n").encode()
+    files["info/index.json"] = (json.dumps(package.index(), indent=2) + "\n").encode()
     files["info/paths.json"] = (json.dumps(paths, indent=2) + "\n").encode()
 
     archive = build_archive(files)
-    ARCHIVE.write_bytes(archive)
+    (CHANNEL / "noarch" / package.archive_name).write_bytes(archive)
+    print(f"wrote noarch/{package.archive_name} ({len(archive)} bytes)")
 
-    repodata_path = CHANNEL / "noarch" / "repodata.json"
-    repodata = json.loads(repodata_path.read_text())
-    repodata["packages"][ARCHIVE.name] = index() | {
+    return package.index() | {
         "md5": hashlib.md5(archive).hexdigest(),
         "sha256": sha256(archive),
         "size": len(archive),
     }
-    repodata_path.write_text(json.dumps(repodata, indent=2) + "\n")
 
-    print(f"wrote {ARCHIVE.relative_to(CHANNEL)} ({len(archive)} bytes)")
+
+def main() -> None:
+    packages = [plugin_package(), *probe_packages()]
+    entries = {package.archive_name: write(package) for package in packages}
+
+    repodata_path = CHANNEL / "noarch" / "repodata.json"
+    repodata = json.loads(repodata_path.read_text())
+    repodata["packages"] = dict(sorted((repodata["packages"] | entries).items()))
+    repodata_path.write_text(json.dumps(repodata, indent=2) + "\n")
 
 
 if __name__ == "__main__":

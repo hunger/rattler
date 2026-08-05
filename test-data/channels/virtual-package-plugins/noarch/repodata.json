@@ -27,6 +27,34 @@
       "md5": "9917df3c95c1a42109eef80a75820502",
       "sha256": "0fc92fcced5c5bfb6ca35706fea63470f6aec490b94293d6877fda57ad653c16",
       "size": 854
+    },
+    "foobar-probe-1.0.0-with_foobar.tar.bz2": {
+      "build": "with_foobar",
+      "build_number": 1,
+      "depends": [
+        "__foobar >=1.0"
+      ],
+      "name": "foobar-probe",
+      "noarch": "generic",
+      "subdir": "noarch",
+      "timestamp": 1700000000000,
+      "version": "1.0.0",
+      "md5": "55e76135d6be028b4a5fa7a6a402e558",
+      "sha256": "91aab736d7feb04c89157433e063ffe435e9b182bf29f19add27ca2c8500b34b",
+      "size": 754
+    },
+    "foobar-probe-1.0.0-without_foobar.tar.bz2": {
+      "build": "without_foobar",
+      "build_number": 0,
+      "depends": [],
+      "name": "foobar-probe",
+      "noarch": "generic",
+      "subdir": "noarch",
+      "timestamp": 1700000000000,
+      "version": "1.0.0",
+      "md5": "641b99bbd4dc13be9684a0f1391982e8",
+      "sha256": "0663aede035b468e2f2bc7e6059921c0f675d950d3128555a935e314d05283d6",
+      "size": 754
     }
   }
 }
