@@ -30,6 +30,8 @@
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod activation;
 #[cfg(feature = "experimental-virtual-package-plugins")]
+pub mod assemble;
+#[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod contract;
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub mod demand;
@@ -50,6 +52,8 @@ pub mod runner;
 
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use activation::{ActivationError, activated_environment};
+#[cfg(feature = "experimental-virtual-package-plugins")]
+pub use assemble::{AssembleError, AssembleOptions, virtual_packages_for_solve};
 #[cfg(feature = "experimental-virtual-package-plugins")]
 pub use contract::{ContractViolation, validate};
 #[cfg(feature = "experimental-virtual-package-plugins")]

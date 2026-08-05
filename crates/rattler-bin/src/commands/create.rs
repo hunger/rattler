@@ -24,6 +24,7 @@ use rattler_solve::{
     libsolv_c::{self},
     resolvo,
 };
+#[cfg(not(feature = "experimental-virtual-package-plugins"))]
 use rattler_virtual_packages::{VirtualPackageOverrides, VirtualPackages};
 
 use crate::{
@@ -200,7 +201,7 @@ pub async fn create(opt: Opt, offline: bool) -> miette::Result<()> {
         "loading repodata",
         gateway
             .query(
-                channels,
+                channels.clone(),
                 [install_platform, Platform::NoArch],
                 specs.clone(),
             )
@@ -226,9 +227,12 @@ pub async fn create(opt: Opt, offline: bool) -> miette::Result<()> {
     // Determine virtual packages of the system. These packages define the
     // capabilities of the system. Some packages depend on these virtual
     // packages to indicate compatibility with the hardware of the system.
-    let virtual_packages = wrap_in_progress("determining virtual packages", move || {
-        if let Some(virtual_packages) = opt.virtual_package {
-            Ok(virtual_packages
+    let virtual_packages = match opt.virtual_package {
+        // `--virtual-package` replaces the set outright: nothing is detected and
+        // no plugin is asked, which is what makes it the way to solve for a
+        // machine other than this one.
+        Some(given) => wrap_in_progress("determining virtual packages", move || {
+            given
                 .iter()
                 .map(|virt_pkg| {
                     let elems = virt_pkg.split('=').collect::<Vec<&str>>();
@@ -241,16 +245,33 @@ pub async fn create(opt: Opt, offline: bool) -> miette::Result<()> {
                         build_string: (*elems.get(2).unwrap_or(&"")).to_string(),
                     })
                 })
-                .collect::<miette::Result<Vec<_>>>()?)
-        } else {
+                .collect::<miette::Result<Vec<_>>>()
+        })?,
+
+        // A channel's plugins speak for names this client cannot detect, so a
+        // package depending on one is unsolvable without asking them.
+        #[cfg(feature = "experimental-virtual-package-plugins")]
+        None => {
+            plugin_virtual_packages(
+                &gateway,
+                &channels,
+                install_platform,
+                &cache_dir,
+                &repo_data,
+            )
+            .await?
+        }
+
+        #[cfg(not(feature = "experimental-virtual-package-plugins"))]
+        None => wrap_in_progress("determining virtual packages", || {
             VirtualPackages::detect_for_platform(
                 install_platform,
                 &VirtualPackageOverrides::from_env(),
             )
             .map(|vpkgs| vpkgs.into_generic_virtual_packages().collect::<Vec<_>>())
             .into_diagnostic()
-        }
-    })?;
+        })?,
+    };
 
     println!(
         "Virtual packages:\n{}\n",
@@ -414,4 +435,63 @@ fn print_transaction(
             }
         }
     }
+}
+
+/// This client's virtual packages together with whatever the channels' plugins
+/// report.
+///
+/// A plugin runs only if the solve could ask for one of the names it won, which
+/// is decided by scanning the repodata already in memory: detection can mean
+/// solving an environment, installing it and running a program, and a plugin
+/// speaking only for names nothing mentions cannot change the outcome.
+#[cfg(feature = "experimental-virtual-package-plugins")]
+async fn plugin_virtual_packages(
+    gateway: &Gateway,
+    channels: &[Channel],
+    platform: Platform,
+    cache_dir: &std::path::Path,
+    repo_data: &[rattler_repodata_gateway::RepoData],
+) -> miette::Result<Vec<GenericVirtualPackage>> {
+    use rattler_cache::virtual_package_plugin_cache::VirtualPackagePluginCache;
+    use rattler_virtual_package_plugins::{
+        AssembleOptions, PluginOverrides, RunTimeout, virtual_packages_for_solve,
+        virtual_packages_mentioned,
+    };
+
+    let needed = virtual_packages_mentioned(
+        repo_data
+            .iter()
+            .flat_map(rattler_repodata_gateway::RepoData::iter)
+            .flat_map(|record| {
+                record
+                    .package_record
+                    .depends
+                    .iter()
+                    .chain(&record.package_record.constrains)
+            })
+            .map(String::as_str),
+    );
+
+    let overrides = PluginOverrides::from_env();
+    let detected = virtual_packages_for_solve(AssembleOptions {
+        gateway,
+        channels,
+        platform,
+        package_cache: &PackageCache::new(cache_dir.join(rattler_cache::PACKAGE_CACHE_DIR)),
+        detection_cache: &VirtualPackagePluginCache::new(
+            cache_dir.join(rattler_cache::VIRTUAL_PACKAGE_PLUGINS_CACHE_DIR),
+        ),
+        environment_root: &cache_dir.join(rattler_cache::EXEC_ENVS_DIR).join("plugins"),
+        timeout: RunTimeout::default(),
+        now: jiff::Timestamp::now().as_second(),
+        overrides: &overrides,
+        needed: &needed,
+    })
+    .await
+    .map_err(|err| miette::miette!(err))?;
+
+    Ok(detected
+        .into_iter()
+        .map(|detected| detected.package)
+        .collect())
 }

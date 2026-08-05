@@ -28,7 +28,8 @@ beyond the feature flag itself.
 | Plugin environment creation | Implemented |
 | Detection end to end (orchestration) | Implemented |
 | `CONDA_OVERRIDE_*` for built-ins and plugin virtual packages | Implemented -- general and channel-qualified forms; a fully overridden plugin is not run |
-| Solver injection, lockfile representation | Not implemented |
+| Solver injection (`rattler create`) | Implemented -- `virtual_packages_for_solve` assembles built-ins plus the channels' plugin verdicts |
+| Lockfile representation | Not implemented |
 | Trust / opt-in model | Open, blocks execution |
 | prefix.dev upload validation | Proposed, server side; nothing here depends on it |
 
@@ -803,6 +804,17 @@ skipped and which channel took it.
 **Built-ins are the weakest source.** A plugin claiming a name the client also detects overrides it.
 CEP 30 requires such a name to be *present* and does not dictate that the client's own detection is
 what fills it, so a channel that knows better about `__cuda` may say so.
+
+**A solve gets the plugins' virtual packages, not just the built-ins.** `rattler create` used to
+detect only what the client itself knows, so a package depending on a name only a plugin speaks for
+was unsolvable -- the flag `--virtual-package` was the only way to fake one, and it replaces the
+whole set rather than adding to it. `virtual_packages_for_solve` does the assembly instead: a view
+per channel, the registrations each view inherits, CEP-42 resolution of who speaks for what, then
+detection of only the names the solve could ask for. `--virtual-package` still short-circuits all of
+it, which is what makes it the way to solve for a machine other than this one.
+
+The order matters and getting it wrong is silent rather than loud, which is why it lives in one
+function rather than in each caller.
 
 **`CONDA_OVERRIDE_*` for the built-ins is the factory's job.** `BuiltinVirtualPackages::from_env`
 holds the `VirtualPackageOverrides` and applies them in `resolve`, and it is the only thing that
