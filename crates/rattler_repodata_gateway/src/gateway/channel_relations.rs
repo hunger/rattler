@@ -23,7 +23,7 @@ pub const DEFAULT_CHANNEL_RELATIONS_MAX_DEPTH: usize = 10;
 
 /// Where a [`PriorityEdge`] originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum EdgeSource {
+pub(super) enum EdgeSource {
     /// Implied by the user's channel ordering.
     User,
     /// Declared via the `to` channel's `base`.
@@ -34,34 +34,34 @@ pub enum EdgeSource {
 
 /// Directed priority edge: `from` outranks `to`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PriorityEdge<K> {
-    pub from: K,
-    pub to: K,
-    pub source: EdgeSource,
+pub(super) struct PriorityEdge<K> {
+    pub(super) from: K,
+    pub(super) to: K,
+    pub(super) source: EdgeSource,
 }
 
 /// Outcome of a channel priority resolution. Always succeeds; the
 /// caller surfaces `ignored_edges` / `broken_cycle_edges` as warnings
 /// or errors per its mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Resolution<K> {
+pub(super) struct Resolution<K> {
     /// Final priority order, highest first.
-    pub order: Vec<K>,
+    pub(super) order: Vec<K>,
     /// Edges respected by `order`.
-    pub edges: Vec<PriorityEdge<K>>,
+    pub(super) edges: Vec<PriorityEdge<K>>,
     /// Relation edges dropped because they contradicted the user's
     /// explicit ordering. Surfaced by the expander as
     /// `UserOrderConflict` warnings.
-    pub ignored_edges: Vec<PriorityEdge<K>>,
+    pub(super) ignored_edges: Vec<PriorityEdge<K>>,
     /// Relation edges dropped to break a cycle.
-    pub broken_cycle_edges: Vec<PriorityEdge<K>>,
+    pub(super) broken_cycle_edges: Vec<PriorityEdge<K>>,
 }
 
 /// Resolve the priority order over `discovered_channels` from the
 /// user's channel order plus the deduplicated relation edges. The
 /// output is fully determined by the inputs; callers needing
 /// run-to-run determinism must pass canonically ordered slices.
-pub fn resolve_channel_priority<K>(
+pub(super) fn resolve_channel_priority<K>(
     user_channels: &[K],
     discovered_channels: &[K],
     relation_edges: &[PriorityEdge<K>],
